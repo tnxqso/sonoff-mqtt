@@ -65,14 +65,36 @@ Copy the new versions in, update the commit and date above, and re-run the
 integration tests. Pay particular attention to changes in send(), the payload
 field set, and anything touching apikey or selfApikey.
 
-## Open question this code may answer
+## Settled: shared devices work from the sharee's own session
 
-Our own testing against the openHAB binding concluded that commanding a device
-shared from another account requires a WebSocket session authenticated AS THE
-OWNER. This code disagrees: it sends the owner's apikey together with our own
-selfApikey over our own session, and has done so in production for years.
+Testing against the openHAB binding had led us to conclude that a device shared
+from another account could only be commanded over a WebSocket authenticated AS
+THE OWNER, which is why that setup ran a second account bridge purely for the
+neighbour's devices.
 
-The binding never sent selfApikey at all, so our test may simply have been
-sending the wrong fields rather than proving a session requirement. This is
-worth testing before the architecture is settled, because if upstream is right
-the two-account setup may not be needed.
+That conclusion was wrong, and this code is why. Verified 2026-09-09 against a
+lamp owned by another account and shared to ours:
+
+    send switch=on   -> receipt "online", query returns "switch": "on"
+    send switch=off  -> receipt "online", query returns "switch": "off"
+    send switch=on   -> receipt "online", query returns "switch": "on"
+
+The difference is the payload. send() puts the OWNER's apikey in "apikey" and
+OUR OWN in "selfApikey". The binding sent only its own apikey and had no
+selfApikey field at all, so its failure proved nothing about sessions, only that
+the wrong fields are rejected.
+
+Consequence: one account and one session is enough, provided every device is
+shared to it. No second account, and no need to hold anyone else's password.
+
+The same run also confirmed the verification mechanism. A send() with no params
+issues {"action":"query"} and the reply carries the full params object, so a
+command can be checked against what actually happened. Receipts came back in
+90-120 ms, queries in about 20 ms.
+
+Multi-home discovery was confirmed at the same time: get_homes() followed by
+get_devices(list_of_home_ids) returns devices from every home, including the one
+that is not currently active in the phone app. A plain listing sees only the
+active home, which is a trap the binding never got past.
+
+See tests/test_shared_device.py for the probe that established all of this.

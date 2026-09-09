@@ -1,0 +1,65 @@
+# sonoff-mqtt configuration
+#
+# Copy this file to config.yml and fill in the real values. config.yml is
+# gitignored, this example is not, so no secret and no personal detail belongs
+# in here.
+#
+# Any string value may be written as ${ENV_VAR} to read it from the environment
+# instead. Prefer that for passwords when running as a service.
+
+accounts:
+  # One entry per eWeLink account. Each becomes its own cloud session with its
+  # own WebSocket. A command is routed to the session whose account owns the
+  # device, so a device shared between two accounts still resolves to exactly
+  # one session.
+  #
+  # A single account is enough if devices shared to it can be commanded from
+  # its own session. Add a second account only if that turns out not to work.
+  - name: primary
+    email: user@example.com
+    password: ${SONOFF_PRIMARY_PASSWORD}
+    country_code: "+46"
+    # Which eWeLink homes to read devices from. The cloud returns only the
+    # active home unless each family is asked for explicitly, so a device in
+    # another home stays invisible if this is left empty. List the ids here,
+    # or let the service enumerate them at startup.
+    homes: []
+
+app:
+  # Application credentials presented to the eWeLink cloud.
+  #
+  # eWeLink evicts an older session when a newer one logs in with the same
+  # appid for the same account. If another client is running against these
+  # accounts, give this service a different pair or the two will fight over
+  # the connection.
+  appid: CHANGE_ME
+  appsecret: CHANGE_ME
+
+mqtt:
+  host: mqtt.example.local
+  port: 1883
+  username: null
+  password: null
+  client_id: sonoff-mqtt
+  # Topics are <base>/<deviceid>/... State is published retained, commands are
+  # read from <base>/<deviceid>/set
+  base_topic: sonoff
+
+# How a command is confirmed. After sending, the real state is read back with a
+# WebSocket query and compared against what was asked for. The binding this
+# replaces never did that, which is why a dropped command could leave a device
+# in the wrong state with nothing noticing.
+verification:
+  enabled: true
+  # How long to wait after the receipt before reading the state back. The relay
+  # needs a moment to move and report.
+  settle_seconds: 2.0
+  # Attempts in total, including the first send
+  max_attempts: 3
+  # Delay before the first retry, doubling each time
+  retry_backoff_seconds: 5.0
+
+logging:
+  level: INFO
+  # DEBUG shows every frame on the wire. Very verbose.
+  ewelink_level: INFO
