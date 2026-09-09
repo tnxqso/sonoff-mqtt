@@ -37,7 +37,7 @@ from sonoff_mqtt.vendor.ewelink.cloud import XRegistryCloud
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "config.yml"
 
 # Fredrik's patio lamp, shared to our account. S26R2, uiid 1.
-TARGET_DEVICEID = "100144ff84"
+TARGET_DEVICEID = "CHANGE_ME"
 
 # Which configured account to log in as. This is the SHAREE, the account the
 # lamp was shared to, which is the whole point of the test.
