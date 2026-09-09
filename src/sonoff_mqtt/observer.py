@@ -1,0 +1,316 @@
+"""Read-only bridge from the eWeLink cloud to MQTT.
+
+This publishes device state and never sends a command, so it can run alongside
+an existing client without competing for control. That is deliberate for the
+first phase: it establishes how the connection behaves over days, how often it
+drops, whether two clients on one account evict each other, before anything
+depends on it.
+
+Note what it can and cannot see. The cloud pushes a state update to every client
+EXCEPT the one that caused the change, so while another client is driving these
+devices this process sees everything it does. Once this process starts sending
+its own commands it will stop seeing echoes of them and will have to read state
+back with a query instead.
+"""
+
+# 1. Standard library
+import asyncio
+import logging
+from typing import Any, Dict, Optional
+
+# 2. Third-party
+import aiohttp
+
+# 3. Project-local
+from .config import Config
+from .devices import DeviceRegistry
+from .mqtt import MqttPublisher
+from .vendor.ewelink.base import SIGNAL_CONNECTED, SIGNAL_UPDATE
+from .vendor.ewelink.cloud import XRegistryCloud
+
+_LOGGER = logging.getLogger(__name__)
+
+# How long to wait for a cloud session to come online before giving up on it
+CONNECT_TIMEOUT_SECONDS = 60
+
+
+class Observer:
+    def __init__(self, config: Config):
+        self.config = config
+        self.registry = DeviceRegistry(config.mqtt.base_topic)
+        self.mqtt = MqttPublisher(config.mqtt)
+        self._clients: Dict[str, XRegistryCloud] = {}
+        self._session: aiohttp.ClientSession | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    async def run(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self.mqtt.on_command = self._on_mqtt_command
+        self.mqtt.start()
+        self._session = aiohttp.ClientSession()
+
+        try:
+            for account in self.config.accounts:
+                await self._start_account(account)
+
+            if len(self.registry) == 0:
+                _LOGGER.error("No devices found on any account, nothing to observe")
+                return
+
+            _LOGGER.info("Observing %d device(s). Ctrl-C to stop.", len(self.registry))
+            # The cloud clients each run their own task; this just parks until
+            # cancelled
+            await asyncio.Event().wait()
+
+        finally:
+            await self._shutdown()
+
+    async def _start_account(self, account) -> None:
+        _LOGGER.info("Account %s: logging in as %s", account.name, account.email)
+
+        cloud = XRegistryCloud(self._session)
+        await cloud.login(account.email, account.password, account.country_code)
+        own_apikey = cloud.auth["user"]["apikey"]
+        _LOGGER.info("Account %s: logged in, region %s", account.name, cloud.region)
+
+        # A plain device listing returns only the home that is currently active
+        # in the phone app, so every family has to be asked for by id or devices
+        # in the other homes stay invisible.
+        homes = await cloud.get_homes()
+        _LOGGER.info("Account %s: homes %s", account.name, homes)
+
+        wanted = account.homes or list(homes.keys())
+        raw_devices = await cloud.get_devices(wanted)
+        _LOGGER.info(
+            "Account %s: %d device(s) across %d home(s)",
+            account.name,
+            len(raw_devices),
+            len(wanted),
+        )
+
+        for raw in raw_devices:
+            device = self.registry.add(raw, cloud, own_apikey)
+            _LOGGER.info(
+                "  %s  %-6s uiid=%-3s online=%-5s %s",
+                device.deviceid,
+                "shared" if device.shared else "own",
+                device.uiid,
+                device.online,
+                device.name,
+            )
+
+        cloud.dispatcher_connect(SIGNAL_UPDATE, self._on_update)
+        cloud.dispatcher_connect(
+            SIGNAL_CONNECTED, lambda: self._on_connected(account.name, cloud)
+        )
+
+        # self.auth is already set from the login above, so run_forever goes
+        # straight to connect() rather than logging in a second time
+        cloud.start()
+        self._clients[account.name] = cloud
+
+        connected = asyncio.Event()
+        unsubscribe = cloud.dispatcher_connect(
+            SIGNAL_CONNECTED, lambda: connected.set() if cloud.online else None
+        )
+        try:
+            await asyncio.wait_for(connected.wait(), CONNECT_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            _LOGGER.error(
+                "Account %s: WebSocket did not come online within %ds",
+                account.name,
+                CONNECT_TIMEOUT_SECONDS,
+            )
+        finally:
+            unsubscribe()
+
+        # The device listing already carried current params, so publish that as
+        # the starting point rather than waiting for the first push, which for
+        # an untouched device could be hours away
+        for device in self.registry.all():
+            self._publish(device)
+
+    def _on_connected(self, account_name: str, cloud: XRegistryCloud) -> None:
+        _LOGGER.info("Account %s: cloud connection state %s", account_name, cloud.online)
+
+    def _on_update(self, data: Dict[str, Any]) -> None:
+        """Handle a state push or a sysmsg from the cloud."""
+        deviceid = data.get("deviceid")
+        if not deviceid:
+            return
+
+        device = self.registry.get(deviceid)
+        if device is None:
+            _LOGGER.debug("Update for unknown device %s, ignoring", deviceid)
+            return
+
+        params = data.get("params")
+        if isinstance(params, dict):
+            # online arrives either inside params or alongside it depending on
+            # whether this is a sysmsg or an ordinary update
+            if "online" in params:
+                device.set_online(bool(params["online"]))
+            device.merge_params(params)
+
+        if "online" in data:
+            device.set_online(bool(data["online"]))
+
+        self._publish(device)
+
+    def _on_mqtt_command(self, deviceid: str, channel: str, payload: str) -> None:
+        """Handle a command from MQTT.
+
+        Called on paho's network thread, not the event loop, so the actual work
+        is handed to the loop rather than done here.
+        """
+        if self._loop is None:
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._send_command(deviceid, channel, payload), self._loop
+        )
+
+    async def _send_command(self, deviceid: str, channel: str, payload: str) -> None:
+        """Send a command and confirm it actually took effect.
+
+        The cloud acknowledges a command with a receipt and nothing more. It
+        does not push the resulting state back to the client that caused the
+        change, and a receipt of error 0 only means the request was accepted,
+        not that the relay moved. A command can be accepted and then quietly
+        dropped, which is how a lamp ends up burning all night while every log
+        line says the switch off succeeded.
+
+        So each command is read back. Send, wait for the device to settle, issue
+        a query, and compare the state that comes back against what was asked
+        for. On a mismatch, back off and try again. When the attempts run out,
+        publish to the error topic so whatever consumes this can raise it with a
+        human.
+        """
+        device = self.registry.get(deviceid)
+        if device is None:
+            _LOGGER.warning("Command for unknown device %s, ignoring", deviceid)
+            return
+
+        client = self.registry.client_for(deviceid)
+        if client is None:
+            _LOGGER.error("No cloud client for %s", deviceid)
+            return
+
+        params = device.command_params(channel, payload)
+        if params is None:
+            return
+
+        expected = device.expected_after(channel, payload)
+        if expected is None:
+            return
+        expected_topic, expected_value = expected
+
+        error_topic = f"{device.topic_prefix}/{channel}/error"
+        config = self.config.verification
+        attempts = config.max_attempts if config.enabled else 1
+        backoff = config.retry_backoff_seconds
+
+        for attempt in range(1, attempts + 1):
+            if attempt > 1:
+                _LOGGER.info(
+                    "%s %s: retry %d of %d in %.1fs",
+                    device.name,
+                    channel,
+                    attempt,
+                    attempts,
+                    backoff,
+                )
+                await asyncio.sleep(backoff)
+                backoff *= 2
+
+            _LOGGER.info("%s %s -> %s", device.name, channel, expected_value)
+            receipt = await client.send(device.raw, params, timeout=10)
+
+            if receipt != "online":
+                _LOGGER.warning(
+                    "%s %s: not accepted, receipt %r", device.name, channel, receipt
+                )
+                continue
+
+            if not config.enabled:
+                _LOGGER.debug("%s %s: verification disabled", device.name, channel)
+                return
+
+            # Give the relay time to move and report before asking about it
+            await asyncio.sleep(config.settle_seconds)
+
+            verified = await self._verify(client, device, expected_topic, expected_value)
+            if verified is True:
+                if attempt > 1:
+                    _LOGGER.info(
+                        "%s %s: confirmed on attempt %d", device.name, channel, attempt
+                    )
+                else:
+                    _LOGGER.info("%s %s: confirmed", device.name, channel)
+                self.mqtt.publish(error_topic, "")
+                return
+
+            if verified is None:
+                _LOGGER.warning(
+                    "%s %s: could not read state back, treating as unconfirmed",
+                    device.name,
+                    channel,
+                )
+            else:
+                _LOGGER.warning(
+                    "%s %s: state did not change to %s",
+                    device.name,
+                    channel,
+                    expected_value,
+                )
+
+        _LOGGER.error(
+            "%s %s: gave up after %d attempt(s), device may be in the wrong state",
+            device.name,
+            channel,
+            attempts,
+        )
+        self.mqtt.publish(
+            error_topic,
+            f"command {expected_value} not confirmed after {attempts} attempt(s)",
+        )
+
+    async def _verify(
+        self, client, device, expected_topic: str, expected_value: str
+    ) -> Optional[bool]:
+        """Read the device state back and compare it against the intent.
+
+        Returns True when the state matches, False when it does not, and None
+        when the state could not be read at all, which is not the same thing:
+        an unreadable device might well have obeyed.
+
+        The query reply arrives asynchronously through the update dispatcher and
+        has already been merged into the device by the time send() returns, so
+        the comparison is made against the device's own topics rather than the
+        return value.
+        """
+        query = await client.send(device.raw, timeout=10)
+        if query != "online":
+            _LOGGER.debug("%s: query returned %r", device.name, query)
+            return None
+
+        for topic, value in device.topics():
+            if topic == expected_topic:
+                return value == expected_value
+
+        _LOGGER.debug("%s: no topic %s in current state", device.name, expected_topic)
+        return None
+
+    def _publish(self, device) -> None:
+        """Publish whatever changed since the last publish for this device."""
+        for topic, payload in device.changed_topics():
+            self.mqtt.publish(topic, payload)
+            device.mark_published(topic, payload)
+
+    async def _shutdown(self) -> None:
+        _LOGGER.info("Shutting down")
+        for name, cloud in self._clients.items():
+            await cloud.stop()
+            _LOGGER.debug("Account %s: cloud client stopped", name)
+        if self._session is not None:
+            await self._session.close()
+        self.mqtt.stop()
