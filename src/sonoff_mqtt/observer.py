@@ -35,12 +35,17 @@ CONNECT_TIMEOUT_SECONDS = 60
 
 
 class Observer:
+    # Occasional drops are normal. This many in one run suggests something is
+    # actively evicting the session rather than the network being unreliable.
+    EVICTION_SUSPECTED_AFTER = 3
+
     def __init__(self, config: Config):
         self.config = config
         self.registry = DeviceRegistry(config.mqtt.base_topic)
         self.mqtt = MqttPublisher(config.mqtt)
         self._clients: Dict[str, XRegistryCloud] = {}
         self._session: aiohttp.ClientSession | None = None
+        self._disconnects: Dict[str, int] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
 
     async def run(self) -> None:
@@ -132,6 +137,31 @@ class Observer:
 
     def _on_connected(self, account_name: str, cloud: XRegistryCloud) -> None:
         _LOGGER.info("Account %s: cloud connection state %s", account_name, cloud.online)
+
+        if cloud.online:
+            self._disconnects[account_name] = 0
+            return
+
+        # Repeated drops on an otherwise healthy network usually mean something
+        # else is logged in with the same credentials. The cloud evicts the
+        # older session whenever a newer one appears with the same appid, so two
+        # clients take turns kicking each other out indefinitely. The vendored
+        # client logs the underlying error 406 as an authentication failure,
+        # which reads as a password problem rather than as a second client.
+        count = self._disconnects.get(account_name, 0) + 1
+        self._disconnects[account_name] = count
+
+        if count == self.EVICTION_SUSPECTED_AFTER:
+            _LOGGER.warning(
+                "Account %s has lost the cloud connection %d times in this run. If "
+                "this keeps repeating, something else is probably logged in with "
+                "the same eWeLink account: the phone app is fine, but another "
+                "bridge, binding or a second copy of this service will evict this "
+                "one. Give the other client its own appid and appsecret, or stop "
+                "it.",
+                account_name,
+                count,
+            )
 
     def _on_update(self, data: Dict[str, Any]) -> None:
         """Handle a state push or a sysmsg from the cloud."""

@@ -69,9 +69,11 @@ the wire protocol, while the eWeLink app numbers the same outlets from one.
 
 ## Setup
 
-Requires Python 3.11 or later and an MQTT broker.
+Requires Python 3.11 or later, Linux, and an MQTT broker.
 
 ```bash
+git clone https://github.com/tnxqso/sonoff-mqtt.git
+cd sonoff-mqtt
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -82,14 +84,254 @@ Edit `config/config.yml`. Passwords may be written literally or as `${ENV_VAR}`
 to be read from the environment, which is the better option when running as a
 service.
 
-Run it:
+The eWeLink login is the same email and password used in the phone app. There is
+no separate API credential. The `appid` and `appsecret` identify the client
+program rather than you, and do not need rotating.
+
+Check the configuration before starting anything:
 
 ```bash
-PYTHONPATH=src python -m sonoff_mqtt --config config/config.yml
+PYTHONPATH=src .venv/bin/python -m sonoff_mqtt --dump-config
 ```
 
-`run.sh` is a launcher that sources the password from
-`~/.config/sonoff-mqtt/env` and is what a process manager should call.
+Then run it in the foreground once to confirm it finds your devices:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m sonoff_mqtt --config config/config.yml
+```
+
+## Running it as a service
+
+`run.sh` is the launcher. It sources the password from a file outside the
+project directory, sets `PYTHONPATH`, and uses the virtualenv interpreter:
+
+```bash
+mkdir -p ~/.config/sonoff-mqtt
+echo 'SONOFF_PRIMARY_PASSWORD=your-password' > ~/.config/sonoff-mqtt/env
+chmod 700 ~/.config/sonoff-mqtt
+chmod 600 ~/.config/sonoff-mqtt/env
+```
+
+Keeping the password out of the project directory means it cannot be committed
+by accident or copied along when the source is moved to another machine.
+
+### With pm2
+
+pm2 is what this is developed and run against, so the instructions are concrete.
+systemd with an `EnvironmentFile` works equally well if you prefer it. Neither
+is something this project supports: if pm2 will not start, that is a pm2
+question.
+
+```bash
+pm2 start ./run.sh --name sonoff-mqtt
+pm2 logs sonoff-mqtt --lines 30 --nostream
+```
+
+Once it looks right, make it survive a reboot. Both steps are needed and the
+second is easy to forget:
+
+```bash
+pm2 save
+pm2 startup        # prints a command to run with sudo, run it
+```
+
+pm2 does **not** rotate logs by default, so the file grows without bound. Install
+the rotation module:
+
+```bash
+pm2 install pm2-logrotate
+pm2 set pm2-logrotate:max_size 10M
+pm2 set pm2-logrotate:retain 7
+pm2 set pm2-logrotate:compress true
+pm2 set pm2-logrotate:rotateInterval '0 0 * * *'
+```
+
+Those settings apply to every pm2 process on the host, not just this one.
+
+A few things worth knowing:
+
+- `pm2 restart sonoff-mqtt` is safer than `pm2 restart <id>`. Id numbers shift
+  when processes are added or removed, the name does not.
+- pm2 reuses the environment from when the process was first started. `run.sh`
+  reads the password file on every start so that does not matter here, but if a
+  change to the environment is not picked up, `pm2 restart sonoff-mqtt
+  --update-env` forces it.
+- After editing the source, restart. A running process keeps the old code, which
+  can produce some confusing debugging.
+
+## Logs
+
+Python logs to stderr, so under pm2 everything lands in the error log even
+though most of it is informational:
+
+```bash
+tail -f ~/.pm2/logs/sonoff-mqtt-error.log
+```
+
+`sonoff-mqtt-out.log` stays empty. That is expected.
+
+The first line of every run is the version, so a log excerpt answers "which
+version are you running" without anyone having to ask.
+
+## Debugging
+
+### Which version
+
+```bash
+PYTHONPATH=src .venv/bin/python -m sonoff_mqtt --version
+```
+
+### What configuration is actually in effect
+
+```bash
+PYTHONPATH=src .venv/bin/python -m sonoff_mqtt --dump-config
+```
+
+Passwords and the app secret are redacted, so the output is safe to paste into
+an issue. It prints values you did not set as well, because "I left it at the
+default" and "I set it to the same as the default" are different things when
+something breaks.
+
+It also works when an environment variable is missing, which is exactly when it
+is most useful: the line will say which variable is not set rather than refusing
+to print anything.
+
+### What is on the bus
+
+```bash
+mosquitto_sub -h your-broker -t 'sonoff/#' -v
+```
+
+Command a device directly, bypassing whatever normally drives it:
+
+```bash
+mosquitto_pub -h your-broker -t 'sonoff/10020db9d1/switch/set' -m 'ON'
+```
+
+Clear a stale error topic:
+
+```bash
+mosquitto_pub -h your-broker -t 'sonoff/10020db9d1/switch/error' -r -n
+```
+
+### What a healthy command looks like
+
+```text
+Webbkamera switch -> OFF
+Webbkamera switch: confirmed
+```
+
+If `confirmed` is replaced by a line saying the state did not change, the cloud
+accepted the command and the device did not obey. That is the case this service
+exists to surface, and the one that previously went unnoticed.
+
+### When a device does not respond
+
+- Check `sonoff/<deviceid>/available`. Offline means it has no power or has lost
+  wifi, and no amount of retrying will help.
+- Check `sonoff/<deviceid>/rssi`. Below roughly -80 dBm, dropped packets become
+  common.
+- Check that the service itself is up and the cloud connection established.
+
+### Turning up the detail
+
+Set `logging.level` to `DEBUG` in the config for this service's own reasoning,
+or `logging.ewelink_level` to `DEBUG` to see every frame on the wire. The second
+is very verbose and is best turned on for a specific test rather than left on.
+
+### Two instances
+
+Running two copies against the same account is worth avoiding. They log in with
+the same credentials and the cloud evicts the older session whenever a newer one
+appears, so they take turns kicking each other out indefinitely while device
+control works sporadically. If they also share an MQTT `client_id`, the broker
+disconnects them in a loop as well, roughly once a second, which is at least
+obvious in the log.
+
+The service takes a lock on startup and refuses to run if another instance holds
+it, but that only covers the same host. Two instances on different machines can
+only be detected through the cloud, and the symptom there is repeated
+reconnects. After several disconnects in one run the log says so explicitly.
+
+If you need another client against the same account, for example while migrating
+away from something else, give it a different `appid` and `appsecret` pair.
+
+## Using it with openHAB
+
+Devices appear as ordinary MQTT things. Payloads are plain `ON` and `OFF`, so no
+transformation is needed.
+
+### Things
+
+```java
+Thing mqtt:topic:Sonoff_Webcam "Sonoff S26R2: Webcam" (mqtt:broker:MyBroker) {
+Channels:
+    Type switch : SwitchBinary "Switch" [ stateTopic="sonoff/10020db9d1/switch", commandTopic="sonoff/10020db9d1/switch/set" ]
+    Type string : CommandError "Command error" [ stateTopic="sonoff/10020db9d1/switch/error" ]
+    Type number : Rssi "RSSI" [ stateTopic="sonoff/10020db9d1/rssi" ]
+}
+```
+
+A four channel device gets one channel per outlet:
+
+```java
+Thing mqtt:topic:Sonoff_FourChPro "Sonoff 4CHPROR3" (mqtt:broker:MyBroker) {
+Channels:
+    Type switch : SwitchBinary0 "Outlet 0" [ stateTopic="sonoff/1001d504c3/switch0", commandTopic="sonoff/1001d504c3/switch0/set" ]
+    Type string : CommandError0 "Command error outlet 0" [ stateTopic="sonoff/1001d504c3/switch0/error" ]
+    Type switch : SwitchBinary1 "Outlet 1" [ stateTopic="sonoff/1001d504c3/switch1", commandTopic="sonoff/1001d504c3/switch1/set" ]
+    Type string : CommandError1 "Command error outlet 1" [ stateTopic="sonoff/1001d504c3/switch1/error" ]
+    Type number : Rssi "RSSI" [ stateTopic="sonoff/1001d504c3/rssi" ]
+}
+```
+
+A channel id must not be just `Switch`. It is a reserved word in the things DSL
+and produces a parser error that does not obviously point at the cause. Use
+`SwitchBinary` or anything else.
+
+### Items
+
+```java
+Switch WebcamOutlet "Webcam [%s]" <poweroutlet> { channel="mqtt:topic:Sonoff_Webcam:SwitchBinary" }
+
+String WebcamError "Webcam command error [%s]" <error> { channel="mqtt:topic:Sonoff_Webcam:CommandError" }
+```
+
+### Do not persist these items
+
+Restoring an item from disk on startup gives what openHAB last assumed, while
+retained MQTT gives what the device last reported. Those are the same thing right
+up until a command is lost, which is the case that matters. Leave persistence off
+for anything driven through here and let the broker be the source of truth.
+
+Items with no MQTT channel, such as a virtual switch driven by a rule, still need
+persistence as usual.
+
+### Rules
+
+Rules that compare an item's current state before deciding whether to send a
+command can now trust that state, which was not true before. When the item says
+off, the device reported off.
+
+Subscribing to the error topics gives you somewhere to notify from. A rule that
+watches a group of error items and sends a push notification when one becomes
+non-empty turns a silent failure into something you hear about the same evening.
+
+## Migrating from the openHAB Sonoff binding
+
+The device ids are the same, so the mapping is mechanical:
+
+| Binding | Here |
+|---|---|
+| `sonoff:1:account:thingid:switch` | `sonoff/<deviceid>/switch` |
+| `sonoff:4:account:thingid:switch0` | `sonoff/<deviceid>/switch0` |
+| One bridge per account | One account entry in the config |
+| A second bridge for shared devices | Not needed, see below |
+
+Stop the binding before starting this service, or both will drive the same
+devices and evict each other's cloud session.
+
+Take persistence off the items at the same time, per the section above.
 
 ## Devices in another eWeLink home
 
@@ -107,17 +349,8 @@ is a trap worth naming because it looks like evidence that a session
 authenticated as the owner is required. It is not.
 
 In practice that means one account is enough, provided every device is shared to
-it. The multi-account support is there for cases where that is not possible.
-
-## Running alongside another client
-
-The cloud evicts an older session when a newer one logs in with the same appid
-for the same account, so two clients sharing credentials will fight. Give this
-service a different `appid` and `appsecret` pair while migrating.
-
-There is an upside during a migration: because the cloud pushes state to every
-client except the one that caused the change, each client is a reliable observer
-of the other.
+it, and you never need to hold anyone else's password. The multi-account support
+is there for cases where sharing is not possible.
 
 ## Credits
 
