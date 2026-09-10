@@ -1,0 +1,41 @@
+# Refuse a tag that does not match the version in the code.
+#
+# The version is logged on every startup so that a log excerpt answers "which
+# version are you running" without anyone having to ask. That only holds if the
+# tag and the code agree. Tagging v0.2.0 while version.py still says 0.1.0 is an
+# easy mistake and produces a release whose logs quietly claim to be something
+# else, which is worse than having no version at all.
+
+name: Version check
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare the tag against __version__
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          code=$(grep -oP '__version__\s*=\s*"\K[^"]+' src/sonoff_mqtt/version.py)
+
+          echo "Tag:  $tag"
+          echo "Code: $code"
+
+          if [ -z "$code" ]; then
+            echo "::error::Could not read __version__ from src/sonoff_mqtt/version.py"
+            exit 1
+          fi
+
+          if [ "$tag" != "$code" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match __version__ $code. \
+          Update version.py, or delete the tag and retag the right commit."
+            exit 1
+          fi
+
+          echo "Tag and code agree."
