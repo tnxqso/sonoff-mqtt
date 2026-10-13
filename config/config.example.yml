@@ -59,6 +59,21 @@ verification:
   # Delay before the first retry, doubling each time
   retry_backoff_seconds: 5.0
 
+# Optional: device state from an mDNS relay on the devices' own network, for
+# devices on another network whose multicast this service cannot see. The relay
+# forwards eWeLink TXT records unchanged over UDP; it holds no devicekeys, and
+# the state is decrypted here with the keys from the cloud device listing. Only
+# switch state is taken from it; commands still go through the cloud. See
+# src/sonoff_mqtt/lan_relay.py for the datagram format.
+lan_relay:
+  enabled: false
+  listen_port: 15353
+  # Datagrams from any other address are dropped. Addresses, not hostnames.
+  allowed_sources: []
+  # Warn when nothing has arrived for this long. A few times the relay's resync
+  # interval.
+  silence_warning_seconds: 180
+
 logging:
   level: INFO
   # DEBUG shows every frame on the wire. Very verbose.

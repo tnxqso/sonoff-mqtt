@@ -10,6 +10,7 @@ loudly on launch rather than surfacing as an obscure error hours later.
 """
 
 # 1. Standard library
+import ipaddress
 import os
 import re
 from dataclasses import dataclass, field
@@ -63,6 +64,16 @@ class VerificationConfig:
 
 
 @dataclass
+class LanRelayConfig:
+    """Where device state forwarded by an mDNS relay arrives, see lan_relay.py."""
+
+    enabled: bool = False
+    listen_port: int = 15353
+    allowed_sources: List[str] = field(default_factory=list)
+    silence_warning_seconds: float = 180.0
+
+
+@dataclass
 class Config:
     accounts: List[AccountConfig]
     app: AppConfig
@@ -70,6 +81,7 @@ class Config:
     verification: VerificationConfig
     log_level: str = "INFO"
     ewelink_log_level: str = "INFO"
+    lan_relay: LanRelayConfig = field(default_factory=LanRelayConfig)
 
 
 class MissingEnvVar(str):
@@ -214,6 +226,8 @@ def load_config(path: Path, strict_env: bool = True) -> Config:
         retry_backoff_seconds=retry_backoff,
     )
 
+    lan_relay = _load_lan_relay(raw.get("lan_relay") or {})
+
     log_raw = raw.get("logging") or {}
 
     return Config(
@@ -223,6 +237,46 @@ def load_config(path: Path, strict_env: bool = True) -> Config:
         verification=verification,
         log_level=log_raw.get("level", "INFO"),
         ewelink_log_level=log_raw.get("ewelink_level", "INFO"),
+        lan_relay=lan_relay,
+    )
+
+
+def _load_lan_relay(lan_raw: Dict[str, Any]) -> LanRelayConfig:
+    """Validate the optional lan_relay section. Absent means disabled."""
+    port = int(lan_raw.get("listen_port", 15353))
+    if not 1 <= port <= 65535:
+        raise ConfigError(f"lan_relay.listen_port must be 1-65535, got {port}")
+
+    sources = [str(s) for s in (lan_raw.get("allowed_sources") or [])]
+    for source in sources:
+        try:
+            ipaddress.ip_address(source)
+        except ValueError:
+            raise ConfigError(
+                f"lan_relay.allowed_sources entry {source!r} is not an IP address. "
+                f"Use addresses, not hostnames, so a DNS answer cannot widen who "
+                f"may feed state into the service."
+            ) from None
+
+    enabled = bool(lan_raw.get("enabled", False))
+    if enabled and not sources:
+        raise ConfigError(
+            "lan_relay is enabled but allowed_sources is empty. Datagrams are only "
+            "accepted from listed addresses, so nothing would ever be received."
+        )
+
+    silence = float(lan_raw.get("silence_warning_seconds", 180.0))
+    if silence < 10:
+        raise ConfigError(
+            f"lan_relay.silence_warning_seconds must be at least 10, got {silence}. "
+            f"Set it to a few times the relay's resync interval."
+        )
+
+    return LanRelayConfig(
+        enabled=enabled,
+        listen_port=port,
+        allowed_sources=sources,
+        silence_warning_seconds=silence,
     )
 
 # ==============================================================================
@@ -291,6 +345,12 @@ def dump(config: "Config") -> str:
     lines.append(f"  settle_seconds        : {config.verification.settle_seconds}")
     lines.append(f"  max_attempts          : {config.verification.max_attempts}")
     lines.append(f"  retry_backoff_seconds : {config.verification.retry_backoff_seconds}")
+
+    lines.append("lan_relay:")
+    lines.append(f"  enabled                 : {config.lan_relay.enabled}")
+    lines.append(f"  listen_port             : {config.lan_relay.listen_port}")
+    lines.append(f"  allowed_sources         : {config.lan_relay.allowed_sources or '(none)'}")
+    lines.append(f"  silence_warning_seconds : {config.lan_relay.silence_warning_seconds}")
 
     lines.append("logging:")
     lines.append(f"  level         : {config.log_level}")

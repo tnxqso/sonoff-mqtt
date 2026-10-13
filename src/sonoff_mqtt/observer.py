@@ -1,16 +1,19 @@
-"""Read-only bridge from the eWeLink cloud to MQTT.
+"""Bridge between the eWeLink cloud and MQTT.
 
-This publishes device state and never sends a command, so it can run alongside
-an existing client without competing for control. That is deliberate for the
-first phase: it establishes how the connection behaves over days, how often it
-drops, whether two clients on one account evict each other, before anything
-depends on it.
+Publishes device state, accepts commands from MQTT and verifies each one by
+reading the state back (see _send_command). It started as a read-only observer
+to establish how the cloud connection behaves over days before anything
+depended on it; commands with verification were added once that was known.
 
 Note what it can and cannot see. The cloud pushes a state update to every client
 EXCEPT the one that caused the change, so while another client is driving these
-devices this process sees everything it does. Once this process starts sending
-its own commands it will stop seeing echoes of them and will have to read state
-back with a query instead.
+devices this process sees everything it does, but it does not see echoes of its
+own commands and has to read state back with a query instead.
+
+Optionally, state also arrives from an mDNS relay on the devices' own network
+(see lan_relay.py). That is a second, independent view of the same devices and
+goes through the same merge-and-publish path, so a change reported by both the
+cloud and the LAN is published once.
 """
 
 # 1. Standard library
@@ -24,6 +27,7 @@ import aiohttp
 # 3. Project-local
 from .config import Config
 from .devices import DeviceRegistry
+from .lan_relay import LanRelayReceiver
 from .mqtt import MqttPublisher
 from .vendor.ewelink.base import SIGNAL_CONNECTED, SIGNAL_UPDATE
 from .vendor.ewelink.cloud import XRegistryCloud
@@ -32,6 +36,11 @@ _LOGGER = logging.getLogger(__name__)
 
 # How long to wait for a cloud session to come online before giving up on it
 CONNECT_TIMEOUT_SECONDS = 60
+
+# Params taken from the LAN relay. The TXT records carry more (ssid, startup,
+# pulse and so on), but only the switch state has been compared against the
+# cloud's format, so nothing else is merged until it has been.
+LAN_STATE_KEYS = ("switch", "switches")
 
 
 class Observer:
@@ -47,6 +56,10 @@ class Observer:
         self._session: aiohttp.ClientSession | None = None
         self._disconnects: Dict[str, int] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._lan_relay: LanRelayReceiver | None = None
+        # Devices with at least one applied LAN record, so the first one is
+        # logged even when it changes nothing
+        self._lan_seen: set[str] = set()
 
     async def run(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -61,6 +74,14 @@ class Observer:
             if len(self.registry) == 0:
                 _LOGGER.error("No devices found on any account, nothing to observe")
                 return
+
+            # Started after the accounts, so the registry and its devicekeys are
+            # in place before the first datagram can arrive
+            if self.config.lan_relay.enabled:
+                self._lan_relay = LanRelayReceiver(
+                    self.config.lan_relay, self._on_lan_state, self._devicekey_for
+                )
+                await self._lan_relay.start()
 
             _LOGGER.info("Observing %d device(s). Ctrl-C to stop.", len(self.registry))
             # The cloud clients each run their own task; this just parks until
@@ -184,6 +205,57 @@ class Observer:
 
         if "online" in data:
             device.set_online(bool(data["online"]))
+
+        self._publish(device)
+
+    def _devicekey_for(self, deviceid: str) -> Optional[str]:
+        """The devicekey from the cloud device listing, kept in memory only."""
+        device = self.registry.get(deviceid)
+        if device is None:
+            return None
+        return device.raw.get("devicekey")
+
+    def _on_lan_state(self, deviceid: str, params: Dict[str, Any], seq: str, event: str) -> None:
+        """Merge switch state decrypted from a relayed mDNS record.
+
+        The LAN and the cloud report the same change independently, and
+        whichever arrives first is published; the other then changes nothing.
+        In the first live test (2026-10-13) the LAN was first every time, under
+        a second after a command against about three seconds for the cloud
+        read-back, but that is not guaranteed. A channel toggled faster than the
+        slower source reports can therefore briefly be published in its
+        intermediate state after the faster source already reported the final
+        one, until the next record corrects it. Not handled until it is seen to
+        matter.
+        """
+        device = self.registry.get(deviceid)
+        if device is None:
+            return
+
+        state = {key: params[key] for key in LAN_STATE_KEYS if key in params}
+        if not state:
+            _LOGGER.debug("%s: LAN %s seq %s carried no switch state", device.name, event, seq)
+            return
+
+        device.merge_params(state)
+        changes = [
+            (topic.rsplit("/", 1)[-1], payload)
+            for topic, payload in device.changed_topics()
+            if topic.rsplit("/", 1)[-1].startswith("switch")
+        ]
+        # Worded unlike the "-> ON" line of _send_command, so a state report is
+        # not mistaken for a command sent over the LAN
+        for channel, payload in changes:
+            _LOGGER.info("%s %s is %s (LAN state, seq %s)", device.name, channel, payload, seq)
+
+        # Usually the cloud has already reported the same change, so most LAN
+        # records change nothing. The first one per device is still logged, as
+        # proof that the LAN path works for it at all.
+        if deviceid not in self._lan_seen:
+            self._lan_seen.add(deviceid)
+            _LOGGER.info("%s: LAN state received (%s, seq %s)", device.name, event, seq)
+        elif not changes:
+            _LOGGER.debug("%s: LAN %s seq %s, no change", device.name, event, seq)
 
         self._publish(device)
 
@@ -338,6 +410,8 @@ class Observer:
 
     async def _shutdown(self) -> None:
         _LOGGER.info("Shutting down")
+        if self._lan_relay is not None:
+            await self._lan_relay.stop()
         for name, cloud in self._clients.items():
             await cloud.stop()
             _LOGGER.debug("Account %s: cloud client stopped", name)

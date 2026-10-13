@@ -40,7 +40,8 @@ That read-back is the whole point. Everything else here is plumbing.
 
 ## What it does not do
 
-- No local LAN control. Cloud only.
+- No LAN control. Commands always go through the cloud. Device state can
+  optionally also be received over the LAN, see below.
 - No device discovery protocol for consumers. Topics are `deviceid` based and
   the mapping to friendly names is left to whatever consumes them.
 - Only the device types actually in use here are translated to per-channel
@@ -66,6 +67,20 @@ cloud, which for an untouched device could be hours away.
 
 Note that outlet numbering on a four channel device is zero based here, matching
 the wire protocol, while the eWeLink app numbers the same outlets from one.
+
+## LAN state through an mDNS relay
+
+eWeLink devices announce their state over mDNS, encrypted with the device's
+devicekey. When the devices sit on another network that multicast never reaches
+this service, so a small relay on the devices' own network can forward the
+eWeLink TXT records unchanged over UDP. The relay holds no devicekeys and never
+decrypts; this service decrypts with the keys it already has from the cloud
+device listing and merges the switch state into the same topics, so a change
+seen by both the cloud and the LAN is published once.
+
+This is optional and off by default, see `lan_relay` in
+`config/config.example.yml` and the datagram format in
+`src/sonoff_mqtt/lan_relay.py`. Only switch state is taken from the LAN.
 
 ## Setup
 
