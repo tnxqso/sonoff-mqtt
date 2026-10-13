@@ -71,6 +71,9 @@ class LanRelayConfig:
     listen_port: int = 15353
     allowed_sources: List[str] = field(default_factory=list)
     silence_warning_seconds: float = 180.0
+    # Devices that are sent commands over the LAN first, with the cloud as the
+    # fallback. Explicit per device, so nothing is commanded locally by accident.
+    command_devices: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -272,11 +275,37 @@ def _load_lan_relay(lan_raw: Dict[str, Any]) -> LanRelayConfig:
             f"Set it to a few times the relay's resync interval."
         )
 
+    command_devices: List[str] = []
+    for entry in lan_raw.get("command_devices") or []:
+        # YAML turns an all-digit deviceid into an int, and one with a leading
+        # zero into an octal int, so only quoted or hex-looking ids are trusted
+        if not isinstance(entry, str):
+            raise ConfigError(
+                f"lan_relay.command_devices entry {entry!r} is not a string. "
+                f"Quote the deviceid so YAML does not read it as a number."
+            )
+        deviceid = entry.strip().lower()
+        if len(deviceid) != 10 or any(c not in "0123456789abcdef" for c in deviceid):
+            raise ConfigError(
+                f"lan_relay.command_devices entry {entry!r} is not a deviceid "
+                f"(10 hexadecimal characters)."
+            )
+        if deviceid not in command_devices:
+            command_devices.append(deviceid)
+
+    if command_devices and not enabled:
+        raise ConfigError(
+            "lan_relay.command_devices is set but lan_relay is not enabled. LAN "
+            "commands go to the address in the device's latest relay record, so "
+            "they need the relay."
+        )
+
     return LanRelayConfig(
         enabled=enabled,
         listen_port=port,
         allowed_sources=sources,
         silence_warning_seconds=silence,
+        command_devices=command_devices,
     )
 
 # ==============================================================================
@@ -351,6 +380,7 @@ def dump(config: "Config") -> str:
     lines.append(f"  listen_port             : {config.lan_relay.listen_port}")
     lines.append(f"  allowed_sources         : {config.lan_relay.allowed_sources or '(none)'}")
     lines.append(f"  silence_warning_seconds : {config.lan_relay.silence_warning_seconds}")
+    lines.append(f"  command_devices         : {config.lan_relay.command_devices or '(none)'}")
 
     lines.append("logging:")
     lines.append(f"  level         : {config.log_level}")

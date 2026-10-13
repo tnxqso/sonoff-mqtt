@@ -40,8 +40,9 @@ That read-back is the whole point. Everything else here is plumbing.
 
 ## What it does not do
 
-- No LAN control. Commands always go through the cloud. Device state can
-  optionally also be received over the LAN, see below.
+- No LAN control unless asked for. Commands go through the cloud, except for
+  devices listed in `lan_relay.command_devices`. Device state can optionally
+  also be received over the LAN. Both are described below.
 - No device discovery protocol for consumers. Topics are `deviceid` based and
   the mapping to friendly names is left to whatever consumes them.
 - Only the device types actually in use here are translated to per-channel
@@ -81,6 +82,30 @@ seen by both the cloud and the LAN is published once.
 This is optional and off by default, see `lan_relay` in
 `config/config.example.yml` and the datagram format in
 `src/sonoff_mqtt/lan_relay.py`. Only switch state is taken from the LAN.
+
+### LAN commands
+
+Devices listed in `lan_relay.command_devices` are commanded over the LAN
+first. The command goes straight to the device's own HTTP server, at the
+address and port in its latest relay record, encrypted with its devicekey the
+same way the SonoffLAN integration does it. The relay only carries the result:
+the command counts as confirmed when a record with a new seq shows the
+commanded state. In testing that took about 50 ms, against two to three
+seconds through the cloud. Firmware 3.7.6 counts seq up even for a command that
+changes nothing, so that is confirmed as well.
+
+Anything short of that falls back to the cloud path with its full read-back, so
+the error topic means the same either way: no relay record for the device in
+the last 150 s, a request the device rejected or did not answer within 2 s, or
+no confirmation within 3 s. Resending through the cloud after an unconfirmed LAN
+command is safe because commands are `ON` or `OFF`, never a toggle. A side
+effect is that listed devices can still be commanded while the internet
+connection is down, as long as the relay path is up.
+
+The list is explicit per device and empty by default. Only a device whose
+devicekey is in the cloud device listing can be commanded this way; which of
+the listed devices are usable is logged at startup as
+`LAN commands enabled for: ...`.
 
 ## Setup
 
@@ -231,9 +256,29 @@ mosquitto_pub -h your-broker -t 'sonoff/10020db9d1/switch/error' -r -n
 
 ### What a healthy command looks like
 
+Through the cloud:
+
 ```text
 Webbkamera switch -> OFF
 Webbkamera switch: confirmed
+```
+
+Over the LAN, for a device in `lan_relay.command_devices`:
+
+```text
+Webbkamera switch -> OFF (LAN)
+Webbkamera switch is OFF (LAN state, seq 8427)
+Webbkamera switch: confirmed via LAN in 49 ms
+```
+
+The middle line is the relay reporting the new state, and it is absent when the
+command changed nothing. When the LAN path gives up, one of these lines comes
+first and the cloud lines above follow:
+
+```text
+Webbkamera switch: no fresh relay record for the address, using the cloud
+Webbkamera switch: LAN command not accepted (timeout), falling back to the cloud
+Webbkamera switch: not confirmed via LAN within 3.0s, falling back to the cloud
 ```
 
 If `confirmed` is replaced by a line saying the state did not change, the cloud

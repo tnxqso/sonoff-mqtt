@@ -18,7 +18,9 @@ import socket
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Tuple
+from unittest import mock
 
 # 2. Third-party
 from cryptography.hazmat.primitives import padding
@@ -28,7 +30,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 # 3. Project-local
 from sonoff_mqtt.config import LanRelayConfig
-from sonoff_mqtt.devices import DeviceRegistry
 from sonoff_mqtt.lan_relay import LanRelayReceiver, decrypt_params
 from sonoff_mqtt.observer import Observer
 
@@ -154,10 +155,11 @@ class ObserverMergeTests(unittest.TestCase):
     """The LAN path through Observer._on_lan_state into Device and MQTT."""
 
     def make_observer(self) -> Observer:
-        observer = Observer.__new__(Observer)
-        observer.registry = DeviceRegistry("sonoff")
-        observer.mqtt = FakeMqtt()
-        observer._lan_seen = set()
+        # The real __init__, so attributes added to it later are present here
+        # too; only the MQTT client is replaced, as it would reach for a broker
+        config = SimpleNamespace(mqtt=SimpleNamespace(base_topic="sonoff"))
+        with mock.patch("sonoff_mqtt.observer.MqttPublisher", lambda _config: FakeMqtt()):
+            observer = Observer(config)
         for deviceid, uiid, params in (
             ("10020db9d1", 1, {"switch": "on", "rssi": -60}),
             ("1001d504c3", 4, {"switches": [{"outlet": i, "switch": "off"} for i in range(4)]}),

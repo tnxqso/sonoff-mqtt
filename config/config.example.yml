@@ -73,6 +73,10 @@ lan_relay:
   # Warn when nothing has arrived for this long. A few times the relay's resync
   # interval.
   silence_warning_seconds: 180
+  # Devices commanded over the LAN first, confirmed by the relay, with the
+  # cloud as the fallback. Explicit per device; empty means none. Needs the
+  # relay enabled. Quote a deviceid that is all digits, or YAML reads a number.
+  command_devices: []
 
 logging:
   level: INFO

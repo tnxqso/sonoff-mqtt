@@ -23,20 +23,28 @@ Datagram format, protocol version 1:
 
 "Removed" carries only name and deviceid.
 
-Only state is taken from the LAN here. Commands still go through the cloud.
+Only state is taken from the relay. The relay does not carry commands: for the
+devices listed in lan_relay.command_devices, LanCommandSender below posts a
+command straight to the address and port in the device's latest relay record,
+and the observer waits for the relay to report the result (see
+Observer._try_lan_command). Every other device, and every LAN command that is
+not confirmed, still goes through the cloud.
 """
 
 # 1. Standard library
 import asyncio
 import base64
+import errno
 import hashlib
 import ipaddress
 import json
 import logging
+import os
 import time
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 # 2. Third-party
+import aiohttp
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -55,10 +63,23 @@ DATA_FIELDS = 4
 # How often the silence check runs. The threshold itself is configured.
 SILENCE_CHECK_INTERVAL_SECONDS = 10.0
 
+# How old the latest relay record for a device may be for its address to be
+# used for a LAN command. The relay resends every record each 60 s, so this
+# allows two lost resyncs plus some margin before falling back to the cloud.
+ENDPOINT_FRESH_SECONDS = 150.0
+
+# A device's web server handles one request at a time and resets a connection
+# that arrives while it is busy. Upstream retries that this many times with this
+# delay; the caller's overall timeout still bounds the total.
+LAN_CONNRESET_RETRIES = 10
+LAN_CONNRESET_DELAY_SECONDS = 0.1
+
 # Called with deviceid, decrypted params, seq and the relay's event name
 StateCallback = Callable[[str, Dict[str, Any], str, str], None]
 # Returns the devicekey for a deviceid, or None if the device is unknown
 KeyLookup = Callable[[str], Optional[str]]
+# Returns a unique request sequence, as the vendored XRegistryBase.sequence()
+SequenceSource = Callable[[], Awaitable[str]]
 
 
 # ==============================================================================
@@ -104,6 +125,30 @@ def decrypt_params(data_b64: str, iv_b64: str, devicekey: str) -> Dict[str, Any]
     return params
 
 
+def encrypt_payload(payload: Dict[str, Any], devicekey: str) -> Dict[str, Any]:
+    """Encrypt the data of a LAN command in place, mirrored from upstream encrypt().
+
+    Same commit as the decryption above. The params are serialised compactly,
+    encrypted with AES-128-CBC under md5(devicekey) with a random IV and PKCS7
+    padding, and replaced by their base64 form, with the IV and the encrypt flag
+    added next to them.
+    """
+    plaintext = json.dumps(payload["data"], separators=(",", ":")).encode("utf-8")
+    key = hashlib.md5(devicekey.encode("utf-8")).digest()
+    iv = os.urandom(16)
+
+    padder = padding.PKCS7(128).padder()
+    padded_data = padder.update(plaintext) + padder.finalize()
+
+    encryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
+    ciphertext = encryptor.update(padded_data) + encryptor.finalize()
+
+    payload["encrypt"] = True
+    payload["data"] = base64.b64encode(ciphertext).decode("utf-8")
+    payload["iv"] = base64.b64encode(iv).decode("utf-8")
+    return payload
+
+
 # ==============================================================================
 # Receiver
 # ==============================================================================
@@ -136,6 +181,10 @@ class LanRelayReceiver(asyncio.DatagramProtocol):
         self._reported: Dict[Tuple[str, str], str] = {}
         self._last_rx = time.monotonic()
         self._silent = False
+        # Latest (IPv4 address, port, monotonic receive time) per device, for
+        # LAN commands. Refreshed by every record, including a Resync with an
+        # unchanged seq, so it follows a device that changed address by DHCP.
+        self._endpoints: Dict[str, Tuple[str, int, float]] = {}
 
     # --------------------------------------------------------------------------
     # Lifecycle
@@ -218,6 +267,8 @@ class LanRelayReceiver(asyncio.DatagramProtocol):
         if event == "Removed":
             # Forget the seq so the device is applied again when it reappears
             self._last_seq.pop(deviceid, None)
+            # And its address, so no LAN command goes to a device that has left
+            self._endpoints.pop(deviceid, None)
             _LOGGER.info("LAN relay: %s left mDNS", deviceid)
             return
 
@@ -226,7 +277,36 @@ class LanRelayReceiver(asyncio.DatagramProtocol):
             _LOGGER.warning("LAN relay: %s %s without a txt object", event, deviceid)
             return
 
+        # Before _handle_record, which returns early on an unchanged seq
+        self._remember_endpoint(deviceid, message)
         self._handle_record(deviceid, str(event), txt)
+
+    def _remember_endpoint(self, deviceid: str, message: Dict[str, Any]) -> None:
+        """Keep the first IPv4 address and the port from a relay record."""
+        addresses, port = message.get("addresses"), message.get("port")
+        if not isinstance(addresses, list) or isinstance(port, bool) or not isinstance(port, int):
+            return
+        if not 1 <= port <= 65535:
+            return
+        for address in addresses:
+            try:
+                ip = ipaddress.ip_address(str(address))
+            except ValueError:
+                continue
+            # IPv4 only, as everywhere else on the relay path
+            if ip.version == 4:
+                self._endpoints[deviceid] = (str(ip), port, time.monotonic())
+                return
+
+    def endpoint_for(self, deviceid: str) -> Optional[Tuple[str, int]]:
+        """The (address, port) of a device from a fresh relay record, else None."""
+        endpoint = self._endpoints.get(deviceid)
+        if endpoint is None:
+            return None
+        address, port, received = endpoint
+        if time.monotonic() - received > ENDPOINT_FRESH_SECONDS:
+            return None
+        return address, port
 
     def _track_counter(self, message: Dict[str, Any]) -> None:
         """Note lost datagrams and relay restarts. The resync heals both."""
@@ -294,3 +374,99 @@ class LanRelayReceiver(asyncio.DatagramProtocol):
             return
         self._reported[key] = seq
         _LOGGER.log(level, msg, *args)
+
+
+# ==============================================================================
+# LAN command sender, mirrored from AlexxIT/SonoffLAN local.py at 73690b7
+# (XRegistryLocal.send), reduced to what this service uses: no getState, no
+# sub-devices, no state taken from the reply. On firmware 3.7.6 the reply
+# carries only seq and error, and the result is confirmed through the relay.
+# ==============================================================================
+
+
+class LanCommandSender:
+    """Posts encrypted commands to a device's own HTTP server on port 8081."""
+
+    def __init__(self, session: aiohttp.ClientSession, sequence: SequenceSource):
+        self._session = session
+        self._sequence = sequence
+
+    async def send(
+        self,
+        host: str,
+        port: int,
+        deviceid: str,
+        devicekey: str,
+        params: Dict[str, Any],
+        timeout: float,
+    ) -> str:
+        """Send one command. Returns "online" when the device answered error 0.
+
+        Anything else is a short reason for the log ("timeout", "error 400",
+        "E#CON" and so on, the E# codes as upstream). Error 0 only means the
+        device accepted the request, not that the relay moved.
+        """
+        try:
+            return await asyncio.wait_for(
+                self._send(host, port, deviceid, devicekey, params), timeout
+            )
+        except asyncio.TimeoutError:
+            _LOGGER.debug("%s => LAN %s:%d timeout %.1fs", deviceid, host, port, timeout)
+            return "timeout"
+
+    async def _send(
+        self, host: str, port: int, deviceid: str, devicekey: str, params: Dict[str, Any]
+    ) -> str:
+        # The command is the first key of the params: switch or switches here
+        command = next(iter(params))
+        payload = encrypt_payload(
+            {
+                "sequence": await self._sequence(),
+                "deviceid": deviceid,
+                "selfApikey": "123",
+                "data": params,
+            },
+            devicekey,
+        )
+        url = f"http://{host}:{port}/zeroconf/{command}"
+        log = f"{deviceid} => LAN {host}:{port} {command} {params}"
+
+        for _ in range(LAN_CONNRESET_RETRIES + 1):
+            try:
+                async with self._session.post(
+                    url, json=payload, headers={"Connection": "close"}
+                ) as response:
+                    # Some devices answer unsupported commands with an HTML page
+                    if response.content_type == "text/html":
+                        _LOGGER.debug("%s <= text/html", log)
+                        return "text/html"
+                    try:
+                        # Not every firmware sets application/json
+                        reply = await response.json(content_type=None)
+                    except ValueError:
+                        _LOGGER.debug("%s <= reply is not JSON", log)
+                        return "bad reply"
+                    _LOGGER.debug("%s <= %s", log, reply)
+                    if not isinstance(reply, dict):
+                        return "bad reply"
+                    error = reply.get("error")
+                    return "online" if error == 0 else f"error {error}"
+
+            # ClientConnectorError is a ClientOSError, so it has to come first
+            except aiohttp.ClientConnectorError as e:
+                _LOGGER.debug("%s !! can't connect: %s", log, e)
+                return "E#CON"
+            except aiohttp.ClientOSError as e:
+                if e.errno != errno.ECONNRESET:
+                    _LOGGER.debug("%s !! %s", log, e)
+                    return "E#COE"
+                _LOGGER.debug("%s !! connection reset, retrying", log)
+                await asyncio.sleep(LAN_CONNRESET_DELAY_SECONDS)
+            except aiohttp.ServerDisconnectedError as e:
+                _LOGGER.debug("%s !! %s", log, e)
+                return "E#COS"
+            except aiohttp.ClientError as e:
+                _LOGGER.debug("%s !! %s", log, e)
+                return "E#CLI"
+
+        return "E#CRE"
