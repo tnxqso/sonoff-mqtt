@@ -399,23 +399,35 @@ class LanCommandSender:
         devicekey: str,
         params: Dict[str, Any],
         timeout: float,
+        still_wanted: Optional[Callable[[], bool]] = None,
     ) -> str:
         """Send one command. Returns "online" when the device answered error 0.
 
         Anything else is a short reason for the log ("timeout", "error 400",
         "E#CON" and so on, the E# codes as upstream). Error 0 only means the
         device accepted the request, not that the relay moved.
+
+        still_wanted, when given, is asked before every POST, including each
+        retry after a reset connection. Once it returns False nothing more is
+        posted and the result is "superseded", so a retry of an older command
+        cannot reach the device after a newer command for the same channel.
         """
         try:
             return await asyncio.wait_for(
-                self._send(host, port, deviceid, devicekey, params), timeout
+                self._send(host, port, deviceid, devicekey, params, still_wanted), timeout
             )
         except asyncio.TimeoutError:
             _LOGGER.debug("%s => LAN %s:%d timeout %.1fs", deviceid, host, port, timeout)
             return "timeout"
 
     async def _send(
-        self, host: str, port: int, deviceid: str, devicekey: str, params: Dict[str, Any]
+        self,
+        host: str,
+        port: int,
+        deviceid: str,
+        devicekey: str,
+        params: Dict[str, Any],
+        still_wanted: Optional[Callable[[], bool]] = None,
     ) -> str:
         # The command is the first key of the params: switch or switches here
         command = next(iter(params))
@@ -432,6 +444,9 @@ class LanCommandSender:
         log = f"{deviceid} => LAN {host}:{port} {command} {params}"
 
         for _ in range(LAN_CONNRESET_RETRIES + 1):
+            if still_wanted is not None and not still_wanted():
+                _LOGGER.debug("%s !! superseded, not posting", log)
+                return "superseded"
             try:
                 async with self._session.post(
                     url, json=payload, headers={"Connection": "close"}

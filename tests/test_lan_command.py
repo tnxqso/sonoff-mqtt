@@ -238,6 +238,14 @@ class SenderTests(unittest.IsolatedAsyncioTestCase):
         self.delay = 1.0
         self.assertEqual(await self.send({"switch": "on"}, timeout=0.2), "timeout")
 
+    async def test_not_posted_once_superseded(self):
+        result = await self.sender.send(
+            "127.0.0.1", self.port, CAMERA, DEVICEKEY, {"switch": "on"}, 2.0,
+            still_wanted=lambda: False,
+        )
+        self.assertEqual(result, "superseded")
+        self.assertEqual(self.requests, [])
+
     async def test_connection_refused(self):
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
@@ -287,12 +295,18 @@ class FakeSender:
         self.calls: List[tuple] = []
         self.receipt = "online"
         self.then = None  # zero-argument callable run shortly after the send
+        # Per-call overrides, used in order: (delay, receipt, then). The delay
+        # stands for a POST that takes that long before returning the receipt.
+        self.script: List[tuple] = []
 
-    async def send(self, host, port, deviceid, devicekey, params, timeout):
+    async def send(self, host, port, deviceid, devicekey, params, timeout, still_wanted=None):
         self.calls.append((host, port, deviceid, params))
-        if self.then is not None:
-            asyncio.get_running_loop().call_later(0.05, self.then)
-        return self.receipt
+        delay, receipt, then = self.script.pop(0) if self.script else (0.0, self.receipt, self.then)
+        if then is not None:
+            asyncio.get_running_loop().call_later(0.05, then)
+        if delay:
+            await asyncio.sleep(delay)
+        return receipt
 
 
 class CommandTests(unittest.IsolatedAsyncioTestCase):
@@ -398,6 +412,111 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         await self.observer._send_command(CAMERA, "switch", "ON")
         errors = self.published(f"sonoff/{CAMERA}/switch/error")
         self.assertEqual(errors, ["command ON not confirmed after 3 attempt(s)"])
+
+    # --------------------------------------------------------------------------
+    # Ordering of commands to the same channel, and unexpected exceptions
+    # --------------------------------------------------------------------------
+
+    def switches(self, on_outlets):
+        return {"switches": [{"outlet": i, "switch": "on" if i in on_outlets else "off"}
+                             for i in range(4)]}
+
+    async def test_superseded_command_skips_cloud_fallback_and_error_topic(self):
+        # PTT on switch1: ON times out on the LAN, OFF is confirmed over the LAN
+        # while ON is still waiting. ON must not go on to the cloud.
+        self.sender.script = [
+            (0.2, "timeout", None),
+            (0.0, "online", lambda: self.relay(FOURCH, 101, self.switches(set()))),
+        ]
+        with self.assertLogs(observer_module._LOGGER, level="INFO") as logs:
+            older = asyncio.create_task(self.observer._send_command(FOURCH, "switch1", "ON"))
+            await asyncio.sleep(0.05)
+            await self.observer._send_command(FOURCH, "switch1", "OFF")
+            await older
+        self.assertEqual(len(self.sender.calls), 2)
+        self.assertEqual(self.cloud.calls, [])
+        # Cleared once, by OFF; ON neither clears nor sets it
+        self.assertEqual(self.published(f"sonoff/{FOURCH}/switch1/error"), [""])
+        superseded = [r for r in logs.records if "superseded" in r.getMessage()]
+        self.assertEqual(len(superseded), 1)
+        self.assertEqual(superseded[0].levelname, "INFO")
+        self.assertIn("cloud fallback", superseded[0].getMessage())
+        self.assertFalse([r for r in logs.records if r.levelname == "ERROR"])
+
+    async def test_superseded_command_stops_cloud_retries(self):
+        # ON is already in the cloud path, its first cloud send unanswered,
+        # when OFF starts. ON must not retry and must not report an error.
+        self.sender.script = [
+            (0.0, "error 400", None),
+            (0.0, "online", lambda: self.relay(FOURCH, 101, self.switches(set()))),
+        ]
+
+        async def slow_refuse(raw, params=None, timeout=10):
+            self.cloud.calls.append(params)
+            await asyncio.sleep(0.15)
+            return "timeout"
+        self.cloud.send = slow_refuse
+        with self.assertLogs(observer_module._LOGGER, level="INFO") as logs:
+            older = asyncio.create_task(self.observer._send_command(FOURCH, "switch1", "ON"))
+            await asyncio.sleep(0.05)
+            await self.observer._send_command(FOURCH, "switch1", "OFF")
+            await older
+        self.assertEqual(self.cloud.calls, [{"switches": [{"outlet": 1, "switch": "on"}]}])
+        self.assertEqual(self.published(f"sonoff/{FOURCH}/switch1/error"), [""])
+        self.assertTrue([r for r in logs.records if "superseded" in r.getMessage()])
+        self.assertFalse([r for r in logs.records if r.levelname == "ERROR"])
+
+    async def test_other_channel_does_not_supersede(self):
+        self.sender.script = [
+            (0.2, "timeout", None),
+            (0.0, "online", lambda: self.relay(FOURCH, 101, self.switches({2}))),
+        ]
+        with self.assertLogs(observer_module._LOGGER, level="INFO") as logs:
+            older = asyncio.create_task(self.observer._send_command(FOURCH, "switch1", "ON"))
+            await asyncio.sleep(0.05)
+            await self.observer._send_command(FOURCH, "switch2", "ON")
+            await older
+        # switch1 ON still went through the cloud with its read-back
+        self.assertEqual(self.cloud.calls, [{"switches": [{"outlet": 1, "switch": "on"}]}, None])
+        self.assertEqual(self.published(f"sonoff/{FOURCH}/switch1/error"), [""])
+        self.assertEqual(self.published(f"sonoff/{FOURCH}/switch2/error"), [""])
+        self.assertFalse([r for r in logs.records if "superseded" in r.getMessage()])
+
+    async def test_other_device_does_not_supersede(self):
+        self.sender.script = [(0.2, "timeout", None)]
+        older = asyncio.create_task(self.observer._send_command(CAMERA, "switch", "ON"))
+        await asyncio.sleep(0.05)
+        await self.observer._send_command("1001df4bd4", "switch", "ON")
+        await older
+        self.assertIn({"switch": "on"}, self.cloud.calls)
+        self.assertEqual(self.published(f"sonoff/{CAMERA}/switch/error"), [""])
+
+    async def test_lan_exception_falls_back_to_cloud_and_is_logged(self):
+        async def explode(*args, **kwargs):
+            raise RuntimeError("boom")
+        self.sender.send = explode
+        with self.assertLogs(observer_module._LOGGER, level="ERROR") as logs:
+            await self.observer._send_command(CAMERA, "switch", "ON")
+        self.assertEqual(self.cloud.calls, [{"switch": "on"}, None])
+        self.assertEqual(self.published(f"sonoff/{CAMERA}/switch/error"), [""])
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("LAN attempt failed", logs.records[0].getMessage())
+        self.assertIsInstance(logs.records[0].exc_info[1], RuntimeError)
+
+    async def test_exception_escaping_send_command_is_logged(self):
+        async def broken(deviceid, channel, payload):
+            raise RuntimeError("escaped")
+        self.observer._loop = asyncio.get_running_loop()
+        self.observer._send_command = broken
+        with self.assertLogs(observer_module._LOGGER, level="ERROR") as logs:
+            self.observer._on_mqtt_command(CAMERA, "switch", "ON")
+            for _ in range(20):
+                await asyncio.sleep(0.01)
+                if logs.records:
+                    break
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("failed unexpectedly", logs.records[0].getMessage())
+        self.assertIsInstance(logs.records[0].exc_info[1], RuntimeError)
 
 
 if __name__ == "__main__":

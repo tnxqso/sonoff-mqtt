@@ -22,9 +22,10 @@ read-back stays in place as the fallback for every command that is not.
 
 # 1. Standard library
 import asyncio
+import concurrent.futures
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # 2. Third-party
 import aiohttp
@@ -76,6 +77,11 @@ class Observer:
         # LAN commands waiting for the relay, per device: (expected topic,
         # expected value, future resolved by _on_lan_state)
         self._lan_waiters: Dict[str, List[Tuple[str, str, asyncio.Future]]] = {}
+        # Command generation per (deviceid, channel). Each command takes the
+        # next number when it starts, and an older command stops at its next
+        # step once a newer one exists (see _send_command). Only touched on the
+        # event loop, so it needs no lock.
+        self._command_generation: Dict[Tuple[str, str], int] = {}
 
     async def run(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -325,9 +331,39 @@ class Observer:
         """
         if self._loop is None:
             return
-        asyncio.run_coroutine_threadsafe(
+        future = asyncio.run_coroutine_threadsafe(
             self._send_command(deviceid, channel, payload), self._loop
         )
+        future.add_done_callback(self._command_done_callback(deviceid, channel, payload))
+
+    @staticmethod
+    def _command_done_callback(
+        deviceid: str, channel: str, payload: str
+    ) -> Callable[[concurrent.futures.Future], None]:
+        """Log anything that escapes _send_command, which would otherwise be lost.
+
+        Nothing else ever looks at the future, so without this an exception
+        would leave no log line, no cloud fallback and no error topic.
+        """
+
+        def done(future: concurrent.futures.Future) -> None:
+            if future.cancelled():
+                return
+            exc = future.exception()
+            if exc is not None:
+                _LOGGER.error(
+                    "Command %s %s -> %s failed unexpectedly",
+                    deviceid,
+                    channel,
+                    payload,
+                    exc_info=exc,
+                )
+
+        return done
+
+    def _is_current(self, deviceid: str, channel: str, generation: int) -> bool:
+        """Whether no newer command for this device and channel has started."""
+        return self._command_generation.get((deviceid, channel)) == generation
 
     async def _send_command(self, deviceid: str, channel: str, payload: str) -> None:
         """Send a command and confirm it actually took effect.
@@ -373,8 +409,55 @@ class Observer:
 
         error_topic = f"{device.topic_prefix}/{channel}/error"
 
-        if await self._try_lan_command(device, channel, params, expected_topic, expected_value):
+        # Taken before the first await, so commands are numbered in the order
+        # the loop starts them, which is the order MQTT delivered them in
+        key = (deviceid, channel)
+        generation = self._command_generation.get(key, 0) + 1
+        self._command_generation[key] = generation
+
+        def superseded(step: str) -> bool:
+            """True, after one INFO line, when a newer command for the channel exists.
+
+            Checked before every further step, so the cloud fallback, the cloud
+            retries and the error topic of an older command cannot undo or
+            misreport a newer one. A command already handed to the device or the
+            cloud cannot be recalled this way.
+            """
+            if self._is_current(deviceid, channel, generation):
+                return False
+            _LOGGER.info(
+                "%s %s -> %s: superseded by a newer command, stopping before %s",
+                device.name,
+                channel,
+                expected_value,
+                step,
+            )
+            return True
+
+        try:
+            lan_confirmed = await self._try_lan_command(
+                device,
+                channel,
+                params,
+                expected_topic,
+                expected_value,
+                still_wanted=lambda: self._is_current(deviceid, channel, generation),
+            )
+        except Exception:
+            _LOGGER.exception(
+                "%s %s: LAN attempt failed unexpectedly, falling back to the cloud",
+                device.name,
+                channel,
+            )
+            lan_confirmed = False
+
+        if lan_confirmed:
+            if superseded("clearing the error topic"):
+                return
             self.mqtt.publish(error_topic, "")
+            return
+
+        if superseded("the cloud fallback"):
             return
 
         config = self.config.verification
@@ -383,6 +466,8 @@ class Observer:
 
         for attempt in range(1, attempts + 1):
             if attempt > 1:
+                if superseded(f"cloud retry {attempt}"):
+                    return
                 _LOGGER.info(
                     "%s %s: retry %d of %d in %.1fs",
                     device.name,
@@ -393,10 +478,14 @@ class Observer:
                 )
                 await asyncio.sleep(backoff)
                 backoff *= 2
+                if superseded(f"cloud retry {attempt}"):
+                    return
 
             _LOGGER.info("%s %s -> %s", device.name, channel, expected_value)
             receipt = await client.send(device.raw, params, timeout=10)
 
+            if superseded("checking the cloud receipt"):
+                return
             if receipt != "online":
                 _LOGGER.warning(
                     "%s %s: not accepted, receipt %r", device.name, channel, receipt
@@ -409,8 +498,12 @@ class Observer:
 
             # Give the relay time to move and report before asking about it
             await asyncio.sleep(config.settle_seconds)
+            if superseded("the read-back"):
+                return
 
             verified = await self._verify(client, device, expected_topic, expected_value)
+            if superseded("acting on the read-back"):
+                return
             if verified is True:
                 if attempt > 1:
                     _LOGGER.info(
@@ -453,6 +546,7 @@ class Observer:
         params: Dict[str, Any],
         expected_topic: str,
         expected_value: str,
+        still_wanted: Optional[Callable[[], bool]] = None,
     ) -> bool:
         """Command a device over the LAN and wait for the relay to confirm it.
 
@@ -461,6 +555,9 @@ class Observer:
         about the outcome and the caller goes on to the cloud. There is no
         getState probe: the device's address comes from its latest relay
         record, and a device without a fresh record is not tried at all.
+
+        still_wanted is passed on to the sender, which stops retrying a reset
+        connection once it returns False (a newer command has started).
         """
         if self._lan_sender is None or self._lan_relay is None:
             return False
@@ -490,8 +587,17 @@ class Observer:
         try:
             _LOGGER.info("%s %s -> %s (LAN)", device.name, channel, expected_value)
             receipt = await self._lan_sender.send(
-                host, port, device.deviceid, devicekey, params, LAN_COMMAND_TIMEOUT_SECONDS
+                host,
+                port,
+                device.deviceid,
+                devicekey,
+                params,
+                LAN_COMMAND_TIMEOUT_SECONDS,
+                still_wanted=still_wanted,
             )
+            if receipt == "superseded":
+                # The caller logs this once, as for every other step
+                return False
             if receipt != "online":
                 _LOGGER.warning(
                     "%s %s: LAN command not accepted (%s), falling back to the cloud",
