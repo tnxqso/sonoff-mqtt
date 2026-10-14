@@ -309,6 +309,77 @@ class FakeSender:
         return receipt
 
 
+class SimDevice:
+    """A 4-channel device as both the LAN and the cloud reach it.
+
+    Every command bumps seq and, unless report is False (a lost datagram), makes
+    the relay report the full state, as the firmware does even for a no-op.
+    """
+
+    def __init__(self, test):
+        self.test = test
+        self.outlets = {i: "off" for i in range(4)}
+        self.seq = 100
+        self.stuck = False  # accepts commands but does not move
+
+    def state(self):
+        return {"switches": [{"outlet": i, "switch": s} for i, s in sorted(self.outlets.items())]}
+
+    def apply(self, params, report=True):
+        if not self.stuck:
+            for element in params["switches"]:
+                self.outlets[element["outlet"]] = element["switch"]
+        self.seq += 1
+        if report:
+            self.test.relay(FOURCH, self.seq, self.state())
+
+
+class SimSender:
+    """LAN sender for SimDevice: receipts in order, then "online"."""
+
+    def __init__(self, sim):
+        self.sim = sim
+        self.calls: List[tuple] = []
+        self.receipts: List[str] = []
+
+    async def send(self, host, port, deviceid, devicekey, params, timeout, still_wanted=None):
+        self.calls.append(params)
+        receipt = self.receipts.pop(0) if self.receipts else "online"
+        if receipt == "online":
+            asyncio.get_running_loop().call_later(0.05, self.sim.apply, params)
+        return receipt
+
+
+class SimCloud:
+    """Cloud for SimDevice. A command lands shortly after its receipt returns."""
+
+    def __init__(self, sim, registry):
+        self.sim = sim
+        self.registry = registry
+        self.calls: List[Optional[Dict[str, Any]]] = []
+        self.delays: List[float] = []
+        self.report = True  # whether the relay sees a command landing from the cloud
+        self.then = None  # zero-argument callable run after a command lands
+        self.queries_fail = False
+
+    async def send(self, raw, params=None, timeout=10):
+        self.calls.append(params)
+        if params is None:
+            if self.queries_fail:
+                return "offline"
+            self.registry.get(raw["deviceid"]).merge_params(self.sim.state())
+            return "online"
+        if self.delays:
+            await asyncio.sleep(self.delays.pop(0))
+        asyncio.get_running_loop().call_later(0.05, self.land, params)
+        return "online"
+
+    def land(self, params):
+        self.sim.apply(params, report=self.report)
+        if self.then is not None:
+            self.then()
+
+
 class CommandTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.saved = observer_module.LAN_CONFIRM_TIMEOUT_SECONDS
@@ -343,6 +414,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         observer_module.LAN_CONFIRM_TIMEOUT_SECONDS = self.saved
         self.assertEqual(self.observer._lan_waiters, {})
+        self.assertEqual(self.observer._sends_in_flight, {})
 
     def relay(self, deviceid, seq, params, event="Updated"):
         self.n += 1
@@ -434,10 +506,12 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             await self.observer._send_command(FOURCH, "switch1", "OFF")
             await older
         self.assertEqual(len(self.sender.calls), 2)
-        self.assertEqual(self.cloud.calls, [])
+        # ON's POST was in flight when OFF started, so OFF checks the final
+        # state with one query; ON itself never reaches the cloud
+        self.assertEqual(self.cloud.calls, [None])
         # Cleared once, by OFF; ON neither clears nor sets it
         self.assertEqual(self.published(f"sonoff/{FOURCH}/switch1/error"), [""])
-        superseded = [r for r in logs.records if "superseded" in r.getMessage()]
+        superseded = [r for r in logs.records if "superseded by a newer" in r.getMessage()]
         self.assertEqual(len(superseded), 1)
         self.assertEqual(superseded[0].levelname, "INFO")
         self.assertIn("cloud fallback", superseded[0].getMessage())
@@ -451,7 +525,11 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             (0.0, "online", lambda: self.relay(FOURCH, 101, self.switches(set()))),
         ]
 
+        answer_query = self.cloud.send
+
         async def slow_refuse(raw, params=None, timeout=10):
+            if params is None:
+                return await answer_query(raw, params, timeout)
             self.cloud.calls.append(params)
             await asyncio.sleep(0.15)
             return "timeout"
@@ -461,9 +539,10 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.05)
             await self.observer._send_command(FOURCH, "switch1", "OFF")
             await older
-        self.assertEqual(self.cloud.calls, [{"switches": [{"outlet": 1, "switch": "on"}]}])
+        # ON's one cloud send, then OFF's final check query, and no retry of ON
+        self.assertEqual(self.cloud.calls, [{"switches": [{"outlet": 1, "switch": "on"}]}, None])
         self.assertEqual(self.published(f"sonoff/{FOURCH}/switch1/error"), [""])
-        self.assertTrue([r for r in logs.records if "superseded" in r.getMessage()])
+        self.assertTrue([r for r in logs.records if "superseded by a newer" in r.getMessage()])
         self.assertFalse([r for r in logs.records if r.levelname == "ERROR"])
 
     async def test_other_channel_does_not_supersede(self):
@@ -517,6 +596,129 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(logs.records), 1)
         self.assertIn("failed unexpectedly", logs.records[0].getMessage())
         self.assertIsInstance(logs.records[0].exc_info[1], RuntimeError)
+
+    # --------------------------------------------------------------------------
+    # Final state check after a superseded send may have landed late
+    # --------------------------------------------------------------------------
+
+    def use_sim(self):
+        """Drive FOURCH through SimDevice; ON's cloud send is slow."""
+        sim = SimDevice(self)
+        sender = SimSender(sim)
+        cloud = SimCloud(sim, self.observer.registry)
+        self.observer._lan_sender = sender
+        self.cloud.send = cloud.send
+        # ON is not accepted over the LAN and goes to the cloud, which holds
+        # its send for 0.3 s
+        sender.receipts = ["timeout"]
+        cloud.delays = [0.3]
+        return sim, sender, cloud
+
+    ON1 = {"switches": [{"outlet": 1, "switch": "on"}]}
+    OFF1 = {"switches": [{"outlet": 1, "switch": "off"}]}
+
+    async def ptt(self, *later):
+        """ON, then OFF 50 ms later while ON's cloud send is outstanding."""
+        older = asyncio.create_task(self.observer._send_command(FOURCH, "switch1", "ON"))
+        await asyncio.sleep(0.05)
+        newer = asyncio.create_task(self.observer._send_command(FOURCH, "switch1", "OFF"))
+        tasks = [older, newer]
+        for delay, payload in later:
+            await asyncio.sleep(delay)
+            tasks.append(asyncio.create_task(
+                self.observer._send_command(FOURCH, "switch1", payload)))
+        await asyncio.gather(*tasks)
+
+    async def test_late_cloud_on_is_undone_by_off(self):
+        sim, sender, cloud = self.use_sim()
+        # The late ON lands without a relay record, so only the read-back sees it
+        cloud.report = False
+        with self.assertLogs(observer_module._LOGGER, level="INFO") as logs:
+            await self.ptt()
+        self.assertEqual(sim.outlets[1], "off")
+        self.assertEqual(sender.calls, [self.ON1, self.OFF1, self.OFF1])
+        self.assertEqual(cloud.calls, [self.ON1, None])
+        self.assertEqual(self.published(f"sonoff/{FOURCH}/switch1/error"), [""])
+        self.assertEqual(self.published(f"sonoff/{FOURCH}/switch1")[-1], "OFF")
+        warnings = [r.getMessage() for r in logs.records if r.levelname == "WARNING"]
+        self.assertIn("4CHPROR3 switch1: state changed after a superseded send, resending OFF once",
+                      warnings)
+        self.assertFalse([r for r in logs.records if r.levelname == "ERROR"])
+
+    async def test_late_cloud_on_and_resend_fails(self):
+        sim, sender, cloud = self.use_sim()
+
+        def jam():
+            sim.stuck = True
+        cloud.then = jam
+        with self.assertLogs(observer_module._LOGGER, level="INFO") as logs:
+            await self.ptt()
+        self.assertEqual(sim.outlets[1], "on")
+        self.assertEqual(
+            self.published(f"sonoff/{FOURCH}/switch1/error"),
+            ["command OFF undone by an older command and not confirmed after resending"],
+        )
+        errors = [r.getMessage() for r in logs.records if r.levelname == "ERROR"]
+        self.assertIn("4CHPROR3 switch1: still not OFF after resending, a superseded send "
+                      "may have left the device in the wrong state", errors)
+
+    async def test_final_check_uses_relay_when_cloud_cannot_be_read(self):
+        sim, sender, cloud = self.use_sim()
+        cloud.queries_fail = True
+        with self.assertLogs(observer_module._LOGGER, level="INFO") as logs:
+            await self.ptt()
+        self.assertEqual(sim.outlets[1], "off")
+        self.assertEqual(sender.calls, [self.ON1, self.OFF1, self.OFF1])
+        self.assertEqual(self.published(f"sonoff/{FOURCH}/switch1/error"), [""])
+        self.assertTrue([r for r in logs.records if "state changed after a superseded send"
+                         in r.getMessage()])
+
+    async def test_final_check_agrees(self):
+        sim, sender, cloud = self.use_sim()
+        # The cloud accepts ON but it never reaches the device
+        cloud.land = lambda params: None
+        with self.assertLogs(observer_module._LOGGER, level="INFO") as logs:
+            await self.ptt()
+        self.assertEqual(sim.outlets[1], "off")
+        self.assertEqual(sender.calls, [self.ON1, self.OFF1])
+        self.assertEqual(cloud.calls, [self.ON1, None])
+        self.assertEqual(self.published(f"sonoff/{FOURCH}/switch1/error"), [""])
+        infos = [r.getMessage() for r in logs.records if r.levelname == "INFO"]
+        self.assertIn("4CHPROR3 switch1: final state OFF checked after a superseded send", infos)
+
+    async def test_still_newer_command_stops_the_final_check(self):
+        sim, sender, cloud = self.use_sim()
+        # ON again 0.1 s after OFF, while OFF waits for the first ON's cloud send
+        with self.assertLogs(observer_module._LOGGER, level="INFO") as logs:
+            await self.ptt((0.1, "ON"))
+        messages = [r.getMessage() for r in logs.records]
+        self.assertIn("4CHPROR3 switch1 -> OFF: superseded by a newer command, stopping "
+                      "before waiting for an older send", messages)
+        self.assertFalse([m for m in messages if "resending" in m])
+        # Only the second ON checks the final state, with one query, and agrees
+        self.assertEqual(cloud.calls, [self.ON1, None])
+        self.assertIn("4CHPROR3 switch1: final state ON checked after a superseded send", messages)
+        self.assertEqual(sim.outlets[1], "on")
+        self.assertEqual(self.published(f"sonoff/{FOURCH}/switch1/error"), [""])
+
+    async def test_no_overlap_means_no_extra_wait_or_query(self):
+        with self.assertLogs(observer_module._LOGGER, level="INFO") as logs:
+            # Through the cloud: one send and one read-back, nothing more
+            started = time.monotonic()
+            await self.observer._send_command("1001df4bd4", "switch", "ON")
+            self.assertLess(time.monotonic() - started, 0.25)
+            self.assertEqual(self.cloud.calls, [{"switch": "on"}, None])
+            # Over the LAN: one POST, no query
+            sim, sender, cloud = self.use_sim()
+            sender.receipts = []
+            cloud.delays = []
+            started = time.monotonic()
+            await self.observer._send_command(FOURCH, "switch1", "ON")
+            self.assertLess(time.monotonic() - started, 0.25)
+        self.assertEqual(sender.calls, [self.ON1])
+        self.assertEqual(cloud.calls, [])
+        self.assertEqual(self.observer._overlap_seen, {})
+        self.assertFalse([r for r in logs.records if "final state" in r.getMessage()])
 
 
 if __name__ == "__main__":

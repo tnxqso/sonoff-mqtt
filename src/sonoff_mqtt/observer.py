@@ -23,9 +23,10 @@ read-back stays in place as the fallback for every command that is not.
 # 1. Standard library
 import asyncio
 import concurrent.futures
+import contextlib
 import logging
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 # 2. Third-party
 import aiohttp
@@ -55,6 +56,22 @@ LAN_STATE_KEYS = ("switch", "switches")
 LAN_COMMAND_TIMEOUT_SECONDS = 2.0
 LAN_CONFIRM_TIMEOUT_SECONDS = 3.0
 
+# How long a cloud send waits for its receipt. A send of an older command can
+# therefore still land this long after a newer command has started.
+CLOUD_SEND_TIMEOUT_SECONDS = 10
+
+# Longest a confirmed command waits for an older command's sends before its
+# final check (see Observer._check_final_state). Every send has its own timeout,
+# CLOUD_SEND_TIMEOUT_SECONDS or LAN_COMMAND_TIMEOUT_SECONDS, so this is only a
+# backstop for a send that does not honour it.
+OLDER_SEND_WAIT_MAX_SECONDS = 12.0
+
+# Outcomes of Observer._deliver
+CONFIRMED = "confirmed"
+UNVERIFIED = "unverified"
+SUPERSEDED = "superseded"
+FAILED = "failed"
+
 
 class Observer:
     # Occasional drops are normal. This many in one run suggests something is
@@ -82,6 +99,15 @@ class Observer:
         # step once a newer one exists (see _send_command). Only touched on the
         # event loop, so it needs no lock.
         self._command_generation: Dict[Tuple[str, str], int] = {}
+        # Sends that may still land, per (deviceid, channel): (generation,
+        # future resolved when the send returns or is cancelled). See
+        # _send_in_flight and _check_final_state.
+        self._sends_in_flight: Dict[Tuple[str, str], List[Tuple[int, asyncio.Future]]] = {}
+        # Per (deviceid, channel), the generation that has seen a send of an
+        # older command in flight since it started, and so checks the final state
+        self._overlap_seen: Dict[Tuple[str, str], int] = {}
+        # When a relay record with switch state last arrived, per device
+        self._lan_state_at: Dict[str, float] = {}
 
     async def run(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -283,6 +309,7 @@ class Observer:
         if not state:
             _LOGGER.debug("%s: LAN %s seq %s carried no switch state", device.name, event, seq)
             return
+        self._lan_state_at[deviceid] = time.monotonic()
 
         device.merge_params(state)
         changes = [
@@ -387,6 +414,11 @@ class Observer:
         so the error topic means the same either way. Resending after an
         unconfirmed LAN command is safe because commands are ON or OFF, never a
         toggle.
+
+        Commands to the same channel are numbered. An older command stops at its
+        next step once a newer one has started, and a newer command that saw a
+        send of an older one in flight checks the final state once that send can
+        no longer land (see _check_final_state).
         """
         device = self.registry.get(deviceid)
         if device is None:
@@ -414,6 +446,8 @@ class Observer:
         key = (deviceid, channel)
         generation = self._command_generation.get(key, 0) + 1
         self._command_generation[key] = generation
+        if any(g < generation for g, _ in self._sends_in_flight.get(key, [])):
+            self._overlap_seen[key] = generation
 
         def superseded(step: str) -> bool:
             """True, after one INFO line, when a newer command for the channel exists.
@@ -421,7 +455,8 @@ class Observer:
             Checked before every further step, so the cloud fallback, the cloud
             retries and the error topic of an older command cannot undo or
             misreport a newer one. A command already handed to the device or the
-            cloud cannot be recalled this way.
+            cloud cannot be recalled this way; the newer command checks the
+            final state instead (see _check_final_state).
             """
             if self._is_current(deviceid, channel, generation):
                 return False
@@ -434,6 +469,45 @@ class Observer:
             )
             return True
 
+        outcome = await self._deliver(
+            device, client, channel, params, expected_topic, expected_value, generation, superseded
+        )
+        if outcome != CONFIRMED:
+            return
+
+        if self._overlap_seen.get(key) == generation:
+            await self._check_final_state(
+                device, client, channel, params, expected_topic, expected_value, generation, superseded
+            )
+            return
+
+        if superseded("clearing the error topic"):
+            return
+        self.mqtt.publish(error_topic, "")
+
+    async def _deliver(
+        self,
+        device,
+        client,
+        channel: str,
+        params: Dict[str, Any],
+        expected_topic: str,
+        expected_value: str,
+        generation: int,
+        superseded: Callable[[str], bool],
+        publish_failure: bool = True,
+    ) -> str:
+        """Send a command over the LAN, else the cloud, and confirm it.
+
+        The normal path of _send_command, split out so _check_final_state can
+        resend under the same generation. Returns CONFIRMED, UNVERIFIED (the
+        cloud accepted it and verification is disabled), SUPERSEDED or FAILED.
+        Clearing the error topic after a confirmation is left to the caller; a
+        failure is published here unless publish_failure is False.
+        """
+        key = (device.deviceid, channel)
+        error_topic = f"{device.topic_prefix}/{channel}/error"
+
         try:
             lan_confirmed = await self._try_lan_command(
                 device,
@@ -441,7 +515,8 @@ class Observer:
                 params,
                 expected_topic,
                 expected_value,
-                still_wanted=lambda: self._is_current(deviceid, channel, generation),
+                still_wanted=lambda: self._is_current(device.deviceid, channel, generation),
+                generation=generation,
             )
         except Exception:
             _LOGGER.exception(
@@ -452,13 +527,10 @@ class Observer:
             lan_confirmed = False
 
         if lan_confirmed:
-            if superseded("clearing the error topic"):
-                return
-            self.mqtt.publish(error_topic, "")
-            return
+            return CONFIRMED
 
         if superseded("the cloud fallback"):
-            return
+            return SUPERSEDED
 
         config = self.config.verification
         attempts = config.max_attempts if config.enabled else 1
@@ -467,7 +539,7 @@ class Observer:
         for attempt in range(1, attempts + 1):
             if attempt > 1:
                 if superseded(f"cloud retry {attempt}"):
-                    return
+                    return SUPERSEDED
                 _LOGGER.info(
                     "%s %s: retry %d of %d in %.1fs",
                     device.name,
@@ -479,13 +551,16 @@ class Observer:
                 await asyncio.sleep(backoff)
                 backoff *= 2
                 if superseded(f"cloud retry {attempt}"):
-                    return
+                    return SUPERSEDED
 
             _LOGGER.info("%s %s -> %s", device.name, channel, expected_value)
-            receipt = await client.send(device.raw, params, timeout=10)
+            with self._send_in_flight(key, generation):
+                receipt = await client.send(
+                    device.raw, params, timeout=CLOUD_SEND_TIMEOUT_SECONDS
+                )
 
             if superseded("checking the cloud receipt"):
-                return
+                return SUPERSEDED
             if receipt != "online":
                 _LOGGER.warning(
                     "%s %s: not accepted, receipt %r", device.name, channel, receipt
@@ -494,16 +569,16 @@ class Observer:
 
             if not config.enabled:
                 _LOGGER.debug("%s %s: verification disabled", device.name, channel)
-                return
+                return UNVERIFIED
 
             # Give the relay time to move and report before asking about it
             await asyncio.sleep(config.settle_seconds)
             if superseded("the read-back"):
-                return
+                return SUPERSEDED
 
             verified = await self._verify(client, device, expected_topic, expected_value)
             if superseded("acting on the read-back"):
-                return
+                return SUPERSEDED
             if verified is True:
                 if attempt > 1:
                     _LOGGER.info(
@@ -511,8 +586,7 @@ class Observer:
                     )
                 else:
                     _LOGGER.info("%s %s: confirmed", device.name, channel)
-                self.mqtt.publish(error_topic, "")
-                return
+                return CONFIRMED
 
             if verified is None:
                 _LOGGER.warning(
@@ -534,10 +608,163 @@ class Observer:
             channel,
             attempts,
         )
-        self.mqtt.publish(
-            error_topic,
-            f"command {expected_value} not confirmed after {attempts} attempt(s)",
+        if publish_failure:
+            self.mqtt.publish(
+                error_topic,
+                f"command {expected_value} not confirmed after {attempts} attempt(s)",
+            )
+        return FAILED
+
+    async def _check_final_state(
+        self,
+        device,
+        client,
+        channel: str,
+        params: Dict[str, Any],
+        expected_topic: str,
+        expected_value: str,
+        generation: int,
+        superseded: Callable[[str], bool],
+    ) -> None:
+        """Make sure a late send of an older command did not undo this one.
+
+        Runs only when a send of an older command for the same channel was in
+        flight at some point after this command started. Such a send cannot be
+        recalled: a cloud send can still be delivered until its timeout, and a
+        LAN POST abandoned by its timeout may already have reached the device.
+        Either can land after this command was confirmed, and the older
+        command, being superseded, stops without reporting it.
+
+        So wait until no older send is in flight, give the device
+        settle_seconds more (an abandoned POST may land just after it was
+        cancelled), and read the state back. On a mismatch resend this command
+        once through the normal path, under the same generation, so a still
+        newer command stops all of this at its next check like anywhere else.
+        """
+        key = (device.deviceid, channel)
+        error_topic = f"{device.topic_prefix}/{channel}/error"
+        started = time.monotonic()
+        deadline = started + OLDER_SEND_WAIT_MAX_SECONDS
+
+        while True:
+            pending = [done for g, done in self._sends_in_flight.get(key, []) if g < generation]
+            if not pending:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _LOGGER.warning(
+                    "%s %s: an older send is still outstanding after %.0fs, "
+                    "checking the state anyway",
+                    device.name,
+                    channel,
+                    OLDER_SEND_WAIT_MAX_SECONDS,
+                )
+                break
+            await asyncio.wait(pending, timeout=remaining)
+            if superseded("waiting for an older send"):
+                return
+
+        await asyncio.sleep(self.config.verification.settle_seconds)
+        if superseded("checking the final state"):
+            return
+
+        agrees = await self._read_final_state(
+            client, device, expected_topic, expected_value, started
         )
+        if superseded("acting on the final state"):
+            return
+        if agrees is True:
+            _LOGGER.info(
+                "%s %s: final state %s checked after a superseded send",
+                device.name,
+                channel,
+                expected_value,
+            )
+            self.mqtt.publish(error_topic, "")
+            return
+
+        _LOGGER.warning(
+            "%s %s: %s after a superseded send, resending %s once",
+            device.name,
+            channel,
+            "state could not be read" if agrees is None else "state changed",
+            expected_value,
+        )
+        outcome = await self._deliver(
+            device,
+            client,
+            channel,
+            params,
+            expected_topic,
+            expected_value,
+            generation,
+            superseded,
+            publish_failure=False,
+        )
+        if outcome == CONFIRMED:
+            if superseded("clearing the error topic"):
+                return
+            self.mqtt.publish(error_topic, "")
+        elif outcome == FAILED:
+            _LOGGER.error(
+                "%s %s: still not %s after resending, a superseded send may have "
+                "left the device in the wrong state",
+                device.name,
+                channel,
+                expected_value,
+            )
+            self.mqtt.publish(
+                error_topic,
+                f"command {expected_value} undone by an older command and not "
+                f"confirmed after resending",
+            )
+
+    async def _read_final_state(
+        self, client, device, expected_topic: str, expected_value: str, since: float
+    ) -> Optional[bool]:
+        """The device's state for the final check: the cloud read-back, else the relay.
+
+        The cloud query is a question the device answers, so it shows the device
+        as it is at the time of the query, which is after the wait. The relay
+        speaks only when a record with a new seq arrives, so silence there means
+        either no change or a lost record; its view is used only when the cloud
+        cannot be read and a relay record arrived after since. With neither the
+        result is None, which the caller treats like a mismatch: resending ON or
+        OFF is safe, and the resend is confirmed on its own.
+        """
+        verified = await self._verify(client, device, expected_topic, expected_value)
+        if verified is not None:
+            return verified
+        if self._lan_state_at.get(device.deviceid, float("-inf")) > since:
+            current = dict(device.topics()).get(expected_topic)
+            if current is not None:
+                return current == expected_value
+        return None
+
+    @contextlib.contextmanager
+    def _send_in_flight(self, key: Tuple[str, str], generation: int) -> Iterator[None]:
+        """Track a LAN POST or cloud send from its start until it returns or is cancelled.
+
+        A newer command for the key waits for these before its final check. A
+        send registered by an older command after a newer one started is not
+        expected, since every send follows a generation check without an await
+        in between, but it would still mark the newer one as overlapped.
+        """
+        done = asyncio.get_running_loop().create_future()
+        entry = (generation, done)
+        self._sends_in_flight.setdefault(key, []).append(entry)
+        current = self._command_generation.get(key, generation)
+        if generation < current:
+            self._overlap_seen[key] = current
+        try:
+            yield
+        finally:
+            sends = self._sends_in_flight.get(key, [])
+            if entry in sends:
+                sends.remove(entry)
+            if not sends:
+                self._sends_in_flight.pop(key, None)
+            done.set_result(None)
 
     async def _try_lan_command(
         self,
@@ -547,6 +774,7 @@ class Observer:
         expected_topic: str,
         expected_value: str,
         still_wanted: Optional[Callable[[], bool]] = None,
+        generation: Optional[int] = None,
     ) -> bool:
         """Command a device over the LAN and wait for the relay to confirm it.
 
@@ -558,6 +786,8 @@ class Observer:
 
         still_wanted is passed on to the sender, which stops retrying a reset
         connection once it returns False (a newer command has started).
+        generation, when given, registers the POST as a send in flight for the
+        final check of a newer command (see _send_in_flight).
         """
         if self._lan_sender is None or self._lan_relay is None:
             return False
@@ -586,15 +816,21 @@ class Observer:
         started = time.monotonic()
         try:
             _LOGGER.info("%s %s -> %s (LAN)", device.name, channel, expected_value)
-            receipt = await self._lan_sender.send(
-                host,
-                port,
-                device.deviceid,
-                devicekey,
-                params,
-                LAN_COMMAND_TIMEOUT_SECONDS,
-                still_wanted=still_wanted,
+            tracking = (
+                self._send_in_flight((device.deviceid, channel), generation)
+                if generation is not None
+                else contextlib.nullcontext()
             )
+            with tracking:
+                receipt = await self._lan_sender.send(
+                    host,
+                    port,
+                    device.deviceid,
+                    devicekey,
+                    params,
+                    LAN_COMMAND_TIMEOUT_SECONDS,
+                    still_wanted=still_wanted,
+                )
             if receipt == "superseded":
                 # The caller logs this once, as for every other step
                 return False
