@@ -501,6 +501,17 @@ class MainTests(unittest.TestCase):
     def test_target_is_required(self):
         self.assertIn("--target", self.call_main_error())
 
+    def test_target_must_be_an_ipv4_address(self):
+        for target in ("", "not-an-ip", "2001:db8::1", "192.0.2.256", "host.example"):
+            with self.subTest(target=target):
+                error = self.call_main_error("--target", target)
+                self.assertIn(f"argument --target: not an IPv4 address: {target!r}", error)
+
+    def test_valid_ipv4_target_is_accepted(self):
+        run_args, _ = self.call_main("--target", "198.51.100.7")
+        self.assertEqual(run_args[0], "198.51.100.7")
+        self.assertIsInstance(run_args[0], str)
+
     def test_help_mentions_the_receiver_freshness(self):
         stdout = io.StringIO()
         with mock.patch.object(sys, "argv", ["mdns_relay.py", "--help"]), \

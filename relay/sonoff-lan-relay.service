@@ -1,0 +1,34 @@
+[Unit]
+Description=eWeLink mDNS relay to sonoff-mqtt
+Wants=network-online.target
+After=network-online.target avahi-daemon.service
+
+[Service]
+Type=simple
+# Site values come from the environment file, copied from
+# sonoff-lan-relay.env.example. RELAY_TARGET has no default: it must be set
+# there. Without the file the unit does not start.
+EnvironmentFile=/etc/default/sonoff-lan-relay
+# Defaults; values in the environment file override these
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 RELAY_PORT=15353 RELAY_RESYNC=60
+# ${VAR} always expands to exactly one argument, an empty one if unset, which
+# the relay then rejects at start
+ExecStart=/opt/sonoff-lan-relay/.venv/bin/python /opt/sonoff-lan-relay/mdns_relay.py --target ${RELAY_TARGET} --port ${RELAY_PORT} --resync ${RELAY_RESYNC}
+Restart=always
+RestartSec=10
+# Exit status 2 is an argument error from argparse (for example RELAY_TARGET
+# unset or not an IPv4 address) or Python not finding the script. A restart
+# cannot fix either, so do not loop every 10 s
+RestartPreventExitStatus=2
+
+# The relay holds no secrets; this only keeps it away from everything else
+DynamicUser=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+# AF_NETLINK is needed to list the network interfaces for multicast
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

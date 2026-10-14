@@ -17,6 +17,7 @@ stdout, which systemd sends to the journal.
 # 1. Standard library
 import argparse
 import asyncio
+import ipaddress
 import json
 import logging
 import signal
@@ -201,6 +202,14 @@ async def run(target: str, port: int, duration: int, resync: int) -> int:
     return 0
 
 
+def ipv4_address(value: str) -> str:
+    """argparse type for --target: an IPv4 address, returned in its normal form."""
+    try:
+        return str(ipaddress.IPv4Address(value))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not an IPv4 address: {value!r}") from None
+
+
 def resync_seconds(value: str) -> int:
     """argparse type for --resync: a whole number of seconds, at least the minimum."""
     try:
@@ -215,7 +224,9 @@ def resync_seconds(value: str) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--target", required=True, help="IPv4 address of sonoff-mqtt")
+    parser.add_argument("--target", required=True, type=ipv4_address,
+                        help="IPv4 address of sonoff-mqtt, checked at start; "
+                             "a host name is not accepted")
     parser.add_argument("--port", type=int, default=15353)
     parser.add_argument("--duration", type=int, default=0, help="seconds to run, 0 = until stopped")
     parser.add_argument("--resync", type=resync_seconds, default=60,
