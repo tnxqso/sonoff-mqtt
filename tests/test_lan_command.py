@@ -361,6 +361,7 @@ class SimCloud:
         self.report = True  # whether the relay sees a command landing from the cloud
         self.then = None  # zero-argument callable run after a command lands
         self.queries_fail = False
+        self.land_delay = 0.05  # from the receipt to the device acting on it
 
     async def send(self, raw, params=None, timeout=10):
         self.calls.append(params)
@@ -371,7 +372,7 @@ class SimCloud:
             return "online"
         if self.delays:
             await asyncio.sleep(self.delays.pop(0))
-        asyncio.get_running_loop().call_later(0.05, self.land, params)
+        asyncio.get_running_loop().call_later(self.land_delay, self.land, params)
         return "online"
 
     def land(self, params):
@@ -717,6 +718,56 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertLess(time.monotonic() - started, 0.25)
         self.assertEqual(sender.calls, [self.ON1])
         self.assertEqual(cloud.calls, [])
+        self.assertEqual(self.observer._overlap_seen, {})
+        self.assertFalse([r for r in logs.records if "final state" in r.getMessage()])
+
+    async def start_after_older_send_ended(self):
+        """Start ON over the cloud and return once its cloud send has ended."""
+        older = asyncio.create_task(self.observer._send_command(FOURCH, "switch1", "ON"))
+        while self.observer._sends_in_flight or len(self.cloud_calls()) < 1:
+            await asyncio.sleep(0.005)
+        return older
+
+    def cloud_calls(self):
+        return self.sim_cloud.calls
+
+    async def test_send_ended_within_settle_still_counts_as_overlap(self):
+        # OFF starts just after ON's cloud send ended, with nothing in flight,
+        # and is confirmed over the LAN before ON lands 0.09 s after its
+        # receipt (inside settle_seconds 0.1). Only the recent-end rule makes
+        # OFF check the final state and undo the late ON.
+        sim, sender, self.sim_cloud = self.use_sim()
+        self.sim_cloud.delays = []
+        self.sim_cloud.land_delay = 0.09
+        with self.assertLogs(observer_module._LOGGER, level="INFO") as logs:
+            older = await self.start_after_older_send_ended()
+            self.assertEqual(self.observer._sends_in_flight, {})
+            await self.observer._send_command(FOURCH, "switch1", "OFF")
+            await older
+        self.assertEqual(sim.outlets[1], "off")
+        self.assertEqual(sender.calls, [self.ON1, self.OFF1, self.OFF1])
+        self.assertEqual(self.sim_cloud.calls, [self.ON1, None])
+        self.assertEqual(self.published(f"sonoff/{FOURCH}/switch1/error"), [""])
+        self.assertIn("4CHPROR3 switch1: state changed after a superseded send, resending OFF once",
+                      [r.getMessage() for r in logs.records])
+
+    async def test_send_ended_longer_ago_than_settle_is_no_overlap(self):
+        sim, sender, self.sim_cloud = self.use_sim()
+        self.sim_cloud.delays = []
+        with self.assertLogs(observer_module._LOGGER, level="INFO") as logs:
+            older = await self.start_after_older_send_ended()
+            ended = time.monotonic()
+            # More than settle_seconds after ON's send ended (ON has finished by then)
+            await asyncio.sleep(0.15)
+            started = time.monotonic()
+            await self.observer._send_command(FOURCH, "switch1", "OFF")
+            self.assertLess(time.monotonic() - started, 0.25)
+            await older
+        self.assertGreater(started - ended, self.observer.config.verification.settle_seconds)
+        self.assertEqual(sim.outlets[1], "off")
+        self.assertEqual(sender.calls, [self.ON1, self.OFF1])
+        # ON's send and its own read-back; nothing from OFF
+        self.assertEqual(self.sim_cloud.calls, [self.ON1, None])
         self.assertEqual(self.observer._overlap_seen, {})
         self.assertFalse([r for r in logs.records if "final state" in r.getMessage()])
 

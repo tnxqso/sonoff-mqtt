@@ -56,8 +56,10 @@ LAN_STATE_KEYS = ("switch", "switches")
 LAN_COMMAND_TIMEOUT_SECONDS = 2.0
 LAN_CONFIRM_TIMEOUT_SECONDS = 3.0
 
-# How long a cloud send waits for its receipt. A send of an older command can
-# therefore still land this long after a newer command has started.
+# How long a cloud send waits for its receipt. A receipt is the error code of
+# the server's reply (0 is "online", 504 "timeout"). A local timeout only stops
+# the waiting: the request has already gone out and is not recalled, so a
+# command whose receipt is "timeout" may still land later, with no known bound.
 CLOUD_SEND_TIMEOUT_SECONDS = 10
 
 # Longest a confirmed command waits for an older command's sends before its
@@ -108,6 +110,10 @@ class Observer:
         self._overlap_seen: Dict[Tuple[str, str], int] = {}
         # When a relay record with switch state last arrived, per device
         self._lan_state_at: Dict[str, float] = {}
+        # When each generation's latest send ended, per (deviceid, channel). A
+        # send that ended less than settle_seconds ago may still land, so it
+        # counts as overlap like one in flight. Pruned as it is read.
+        self._sends_ended: Dict[Tuple[str, str], Dict[int, float]] = {}
 
     async def run(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -446,7 +452,7 @@ class Observer:
         key = (deviceid, channel)
         generation = self._command_generation.get(key, 0) + 1
         self._command_generation[key] = generation
-        if any(g < generation for g, _ in self._sends_in_flight.get(key, [])):
+        if self._older_send_may_land(key, generation):
             self._overlap_seen[key] = generation
 
         def superseded(step: str) -> bool:
@@ -629,11 +635,12 @@ class Observer:
         """Make sure a late send of an older command did not undo this one.
 
         Runs only when a send of an older command for the same channel was in
-        flight at some point after this command started. Such a send cannot be
-        recalled: a cloud send can still be delivered until its timeout, and a
-        LAN POST abandoned by its timeout may already have reached the device.
-        Either can land after this command was confirmed, and the older
-        command, being superseded, stops without reporting it.
+        flight at some point after this command started, or had ended less than
+        settle_seconds before it started. Such a send cannot be recalled: a
+        cloud send whose receipt timed out has still gone out, and a LAN POST
+        abandoned by its timeout may already have reached the device. Either can
+        land after this command was confirmed, and the older command, being
+        superseded, stops without reporting it.
 
         So wait until no older send is in flight, give the device
         settle_seconds more (an abandoned POST may land just after it was
@@ -664,6 +671,9 @@ class Observer:
             if superseded("waiting for an older send"):
                 return
 
+        # Every older send has ended by now, so this is at least settle_seconds
+        # after the end of each, including one that ended before this command
+        # started
         await asyncio.sleep(self.config.verification.settle_seconds)
         if superseded("checking the final state"):
             return
@@ -741,6 +751,26 @@ class Observer:
                 return current == expected_value
         return None
 
+    def _older_send_may_land(self, key: Tuple[str, str], generation: int) -> bool:
+        """Whether a send of an older generation for key is in flight or ended recently.
+
+        Recently means less than settle_seconds ago: an abandoned LAN POST may
+        land just after it was cancelled. A cloud send whose receipt timed out
+        may land even later; that is not covered (see CLOUD_SEND_TIMEOUT_SECONDS).
+        """
+        if any(g < generation for g, _ in self._sends_in_flight.get(key, [])):
+            return True
+        ended = self._sends_ended.get(key)
+        if not ended:
+            return False
+        cutoff = time.monotonic() - self.config.verification.settle_seconds
+        for g in [g for g, at in ended.items() if at <= cutoff]:
+            del ended[g]
+        if not ended:
+            del self._sends_ended[key]
+            return False
+        return any(g < generation for g in ended)
+
     @contextlib.contextmanager
     def _send_in_flight(self, key: Tuple[str, str], generation: int) -> Iterator[None]:
         """Track a LAN POST or cloud send from its start until it returns or is cancelled.
@@ -764,6 +794,7 @@ class Observer:
                 sends.remove(entry)
             if not sends:
                 self._sends_in_flight.pop(key, None)
+            self._sends_ended.setdefault(key, {})[generation] = time.monotonic()
             done.set_result(None)
 
     async def _try_lan_command(
