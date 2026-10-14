@@ -245,6 +245,15 @@ class RecordCheckTests(unittest.TestCase):
             self.feed(with_txt(record("10020db9d1", 3, {"switch": "on"}, 3), seq=None))
         self.assertEqual(len(logs.output), 2)
 
+    def test_non_string_data_field_is_skipped(self):
+        # data1 is not a string, so it is left out of the payload and data2
+        # carries all of it; joined as str(123) in front, it would have shifted
+        # the base64 and broken the decryption
+        datagram = record("10020db9d1", 1, {"switch": "on"}, 1, "Added")
+        ciphertext = json.loads(datagram)["txt"]["data1"]
+        self.feed(with_txt(datagram, data1=123, data2=ciphertext))
+        self.assertEqual([(c[2], c[1]) for c in self.collector.calls], [("1", {"switch": "on"})])
+
     def test_removed_needs_no_txt_or_seq(self):
         self.feed(record("10020db9d1", 1, {"switch": "on"}, 1, "Added"))
         with self.assertNoLogs("sonoff_mqtt.lan_relay", level="WARNING"):

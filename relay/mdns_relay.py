@@ -6,9 +6,9 @@ The data1..dataN fields stay encrypted with the devicekey: the relay holds no
 devicekeys and never decrypts. All current records are resent every --resync
 seconds, so a lost datagram or a restart of the receiver heals by itself.
 
-Zeroconf filtering and resolving mirror AlexxIT/SonoffLAN local.py
-(commit 73690b7, _handler1 and _handler2). The datagram format is documented
-in sonoff-mqtt, src/sonoff_mqtt/lan_relay.py (protocol version 1).
+The zeroconf filtering, resolving and TXT handling are modelled on
+AlexxIT/SonoffLAN local.py (_handler1 and _handler2). The datagram format is
+documented in sonoff-mqtt, src/sonoff_mqtt/lan_relay.py (protocol version 1).
 
 Runs until stopped (SIGTERM or SIGINT) unless --duration is given. Logs to
 stdout, which systemd sends to the journal.
@@ -24,6 +24,7 @@ import socket
 import sys
 import time
 import uuid
+from typing import Optional
 
 # 2. Third-party
 from zeroconf import ServiceStateChange, Zeroconf
@@ -32,9 +33,29 @@ from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo, AsyncZerocon
 _LOGGER = logging.getLogger("mdns_relay")
 
 SERVICE_TYPE = "_ewelink._tcp.local."
+# Instance names are "eWeLink_<deviceid>", so the full service name is
+# "eWeLink_<deviceid>._ewelink._tcp.local."
+INSTANCE_PREFIX = "eWeLink_"
 PROTOCOL_VERSION = 1
 # WireGuard MTU is usually 1420; minus 20 (IPv4) and 8 (UDP) leaves 1392 bytes
 SAFE_PAYLOAD_BYTES = 1392
+# Lower bound for --resync, so a typo cannot make the relay flood the path home
+MIN_RESYNC_SECONDS = 5
+
+
+def deviceid_from_name(name: str) -> Optional[str]:
+    """The deviceid in "eWeLink_<deviceid>._ewelink._tcp.local.", else None.
+
+    The service type is compared without regard to case, as DNS names are; the
+    instance prefix has to match exactly.
+    """
+    suffix = "." + SERVICE_TYPE
+    if not name.lower().endswith(suffix.lower()):
+        return None
+    instance = name[:-len(suffix)]
+    if not instance.startswith(INSTANCE_PREFIX):
+        return None
+    return instance[len(INSTANCE_PREFIX):] or None
 
 
 class Relay:
@@ -48,6 +69,12 @@ class Relay:
         self.records: dict[str, dict] = {}
         # Keep task references so they are not garbage collected mid-flight
         self.tasks: set[asyncio.Task] = set()
+        # Bumped on every Removed per service name. A resolve started before a
+        # Removed sees a different generation once its await returns, and then
+        # sends nothing, so it cannot bring a removed device back. Kept per
+        # name for the life of the process: names are bounded by the devices
+        # on the LAN.
+        self.generations: dict[str, int] = {}
         # Send failures are logged on the first one and on recovery only, so a
         # long outage of the path home does not flood the journal
         self.send_failing = False
@@ -76,28 +103,46 @@ class Relay:
     def on_change(self, zeroconf: Zeroconf, service_type: str, name: str,
                   state_change: ServiceStateChange) -> None:
         """Same filter as upstream _handler1, but Removed is forwarded too."""
-        if not name.lower().startswith("ewelink"):
+        deviceid = deviceid_from_name(name)
+        if deviceid is None:
+            _LOGGER.debug("%s: not an eWeLink device name, skipped", name)
             return
         if state_change == ServiceStateChange.Removed:
+            self.generations[name] = self.generations.get(name, 0) + 1
             self.records.pop(name, None)
-            self.send("Removed", {"name": name, "deviceid": name[8:18]})
-            _LOGGER.info("Removed %s", name[8:18])
+            self.send("Removed", {"name": name, "deviceid": deviceid})
+            _LOGGER.info("Removed %s", deviceid)
             return
-        task = asyncio.create_task(self.resolve(zeroconf, service_type, name, state_change.name))
+        # The generation is taken here, not when the task first runs, so a
+        # Removed that comes before the task starts also counts
+        task = asyncio.create_task(self.resolve(zeroconf, service_type, name, state_change.name,
+                                                self.generations.get(name, 0)))
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
 
-    async def resolve(self, zeroconf: Zeroconf, service_type: str, name: str, change: str) -> None:
+    async def resolve(self, zeroconf: Zeroconf, service_type: str, name: str, change: str,
+                      generation: Optional[int] = None) -> None:
         """Upstream _handler2, forwarding the raw TXT instead of decoding it."""
-        deviceid = name[8:18]
+        deviceid = deviceid_from_name(name)
+        if deviceid is None:
+            _LOGGER.debug("%s: not an eWeLink device name, skipped", name)
+            return
+        if generation is None:
+            generation = self.generations.get(name, 0)
         try:
             info = AsyncServiceInfo(service_type, name)
-            if not await info.async_request(zeroconf, 3000) or not info.properties:
+            found = await info.async_request(zeroconf, 3000)
+            if self.generations.get(name, 0) != generation:
+                _LOGGER.debug("%s: removed while resolving (%s), result discarded", deviceid, change)
+                return
+            if not found or not info.properties:
                 _LOGGER.debug("%s: no zeroconf info (%s)", deviceid, change)
                 return
+            # A TXT key without a value comes as None and is not sent
             txt = {
                 k.decode(): v.decode() if isinstance(v, bytes) else v
                 for k, v in info.properties.items()
+                if v is not None
             }
             record = {"name": name, "deviceid": deviceid, "addresses": info.parsed_addresses(),
                       "port": info.port, "txt": txt}
@@ -142,12 +187,30 @@ async def run(target: str, port: int, duration: int, resync: int) -> int:
         else:
             await stop.wait()
     finally:
-        resync_task.cancel()
+        # No new resolves once the browser is gone; then stop and wait for the
+        # ones in flight and the resync, so nothing is cut off by the close
         await browser.async_cancel()
+        pending = [resync_task, *relay.tasks]
+        for task in pending:
+            task.cancel()
+        # return_exceptions, so the cancellations do not propagate or log
+        await asyncio.gather(*pending, return_exceptions=True)
         await aiozc.async_close()
         relay.sock.close()
     _LOGGER.info("stopped, %d datagram(s) sent in run %s", relay.counter, relay.boot)
     return 0
+
+
+def resync_seconds(value: str) -> int:
+    """argparse type for --resync: a whole number of seconds, at least the minimum."""
+    try:
+        seconds = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number of seconds: {value!r}") from None
+    if seconds < MIN_RESYNC_SECONDS:
+        raise argparse.ArgumentTypeError(
+            f"must be at least {MIN_RESYNC_SECONDS} seconds, got {seconds}")
+    return seconds
 
 
 def main() -> int:
@@ -155,7 +218,11 @@ def main() -> int:
     parser.add_argument("--target", required=True, help="IPv4 address of sonoff-mqtt")
     parser.add_argument("--port", type=int, default=15353)
     parser.add_argument("--duration", type=int, default=0, help="seconds to run, 0 = until stopped")
-    parser.add_argument("--resync", type=int, default=60, help="seconds between full resends")
+    parser.add_argument("--resync", type=resync_seconds, default=60,
+                        help=f"seconds between full resends, at least {MIN_RESYNC_SECONDS}. "
+                             "The receiver treats a device address as fresh for 150 s "
+                             "(ENDPOINT_FRESH_SECONDS in src/sonoff_mqtt/lan_relay.py), "
+                             "which assumes the default of 60")
     parser.add_argument("--debug", action="store_true", help="also log unchanged records and resyncs")
     args = parser.parse_args()
 

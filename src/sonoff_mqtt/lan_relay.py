@@ -444,7 +444,10 @@ class LanRelayReceiver(asyncio.DatagramProtocol):
                 deviceid, DATA_FIELDS, ",".join(extra),
             )
 
-        raw = "".join(str(txt[f"data{i}"]) for i in range(1, DATA_FIELDS + 1) if f"data{i}" in txt)
+        # Only string fields: anything else cannot be part of the base64 payload
+        raw = "".join(
+            txt[f"data{i}"] for i in range(1, DATA_FIELDS + 1) if isinstance(txt.get(f"data{i}"), str)
+        )
         try:
             # _is_valid_record lets a record through only encrypted when there is a devicekey
             params = decrypt_params(raw, str(txt.get("iv", "")), devicekey)
