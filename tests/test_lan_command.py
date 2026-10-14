@@ -433,7 +433,11 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.published(f"sonoff/{CAMERA}/switch/error"), [""])
         self.assertIn("ON", self.published(f"sonoff/{CAMERA}/switch"))
 
-    async def test_no_relay_record_falls_back_to_cloud(self):
+    async def test_unconfirmed_lan_command_falls_back_to_cloud(self):
+        # The address is fresh and the device accepts the POST, but no relay
+        # record with a new seq follows, so the LAN command is not confirmed and
+        # the cloud path runs. The path without a fresh relay record, where no
+        # LAN command is sent at all, is test_stale_endpoint_goes_to_cloud.
         await self.observer._send_command(CAMERA, "switch", "ON")
         self.assertEqual(len(self.sender.calls), 1)
         self.assertEqual(self.cloud.calls, [{"switch": "on"}, None])

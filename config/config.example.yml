@@ -63,8 +63,11 @@ verification:
 # devices on another network whose multicast this service cannot see. The relay
 # forwards eWeLink TXT records unchanged over UDP; it holds no devicekeys, and
 # the state is decrypted here with the keys from the cloud device listing. Only
-# switch state is taken from it; commands still go through the cloud. See
-# src/sonoff_mqtt/lan_relay.py for the datagram format.
+# switch state is taken from it. Commands go through the cloud, except for the
+# devices in command_devices below: those are commanded over the LAN while the
+# relay has a fresh address for them, and through the cloud otherwise or when
+# the LAN command is not confirmed. See src/sonoff_mqtt/lan_relay.py for the
+# datagram format.
 lan_relay:
   enabled: false
   listen_port: 15353

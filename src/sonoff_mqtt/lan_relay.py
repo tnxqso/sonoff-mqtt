@@ -66,6 +66,11 @@ SILENCE_CHECK_INTERVAL_SECONDS = 10.0
 # How old the latest relay record for a device may be for its address to be
 # used for a LAN command. The relay resends every record each 60 s, so this
 # allows two lost resyncs plus some margin before falling back to the cloud.
+# That assumes the relay's default resync of 60 s (--resync, RELAY_RESYNC); a
+# longer resync needs a longer value here. Fresh only means that the relay keeps
+# resending the record from its own cache, not that the device is reachable: a
+# device that has gone quiet keeps a fresh address for as long as the relay
+# holds its record.
 ENDPOINT_FRESH_SECONDS = 150.0
 
 # A device's web server handles one request at a time and resets a connection
@@ -350,7 +355,7 @@ class LanRelayReceiver(asyncio.DatagramProtocol):
                 event, deviceid,
             )
 
-        # The Esered LAN is treated as trusted. This check only stops plaintext
+        # The LAN the devices are on is treated as trusted. This check only stops plaintext
         # records for a device that encrypts; a replay of an old ciphertext
         # with a new seq is still possible, as the payload is AES-CBC without a
         # MAC. That is an accepted risk.
@@ -481,7 +486,11 @@ class LanRelayReceiver(asyncio.DatagramProtocol):
 
 
 class LanCommandSender:
-    """Posts encrypted commands to a device's own HTTP server on port 8081."""
+    """Posts encrypted commands to a device's own HTTP server.
+
+    The address and port are passed in by the caller, which takes them from the
+    device's latest relay record (see LanRelayReceiver.endpoint_for).
+    """
 
     def __init__(self, session: aiohttp.ClientSession, sequence: SequenceSource):
         self._session = session

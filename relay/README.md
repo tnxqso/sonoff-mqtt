@@ -1,15 +1,8 @@
 # sonoff-lan-relay
 
-A small mDNS relay for eWeLink (Sonoff) devices. Multicast mDNS does not cross
-routed networks, and the devices ignore mDNS queries that do not come from
-their own link, so sonoff-mqtt cannot see their LAN announcements from another
-network. This relay runs on a machine on the devices' own network, watches
-`_ewelink._tcp` and forwards every record unchanged as one UDP datagram to
-sonoff-mqtt. It holds no devicekeys and never decrypts: the payload stays
-encrypted until sonoff-mqtt reads it.
+A small mDNS relay for eWeLink (Sonoff) devices. Multicast mDNS does not cross routed networks, and the devices ignore mDNS queries that do not come from their own link, so sonoff-mqtt cannot see their LAN announcements from another network. This relay runs on a machine on the devices' own network, watches `_ewelink._tcp` and forwards every record unchanged as one UDP datagram to sonoff-mqtt. It holds no devicekeys and never decrypts: the payload stays encrypted until sonoff-mqtt reads it.
 
-For the full background see the top-level `README.md` of this repository. The
-datagram format is documented at the top of `src/sonoff_mqtt/lan_relay.py`.
+For the full background see the top-level `README.md` of this repository. The datagram format is documented at the top of `src/sonoff_mqtt/lan_relay.py`.
 
 ## Files
 
@@ -25,19 +18,12 @@ datagram format is documented at the top of `src/sonoff_mqtt/lan_relay.py`.
 - Tested on a Raspberry Pi with Debian bookworm and Python 3.11.2.
 - `python3-venv`, to create the relay's own virtual environment.
 - The Pi must be on the same network (link) as the devices.
-- The network path from the Pi to the host running sonoff-mqtt must allow UDP
-  to the receiver port (15353 by default), including any firewall in between.
-- sonoff-mqtt must have the relay enabled and accept the Pi as a source. In its
-  config, under `lan_relay`: `enabled: true`, `listen_port` equal to the
-  relay's port, and the Pi's address in `allowed_sources` (addresses, not host
-  names). Use the address the datagrams arrive from as seen by sonoff-mqtt,
-  which differs from the Pi's LAN address if they pass through NAT or a tunnel.
-  See `config/config.example.yml`.
+- The network path from the Pi to the host running sonoff-mqtt must allow UDP to the receiver port (15353 by default), including any firewall in between.
+- sonoff-mqtt must have the relay enabled and accept the Pi as a source. In its config, under `lan_relay`: `enabled: true`, `listen_port` equal to the relay's port, and the Pi's address in `allowed_sources` (addresses, not host names). Use the address the datagrams arrive from as seen by sonoff-mqtt, which differs from the Pi's LAN address if they pass through NAT or a tunnel. See `config/config.example.yml`.
 
 ## Installation on a new Pi
 
-All commands run as root on the Pi (for example after `sudo -i`), unless
-stated otherwise. Placeholders are in angle brackets.
+All commands run as root on the Pi (for example after `sudo -i`), unless stated otherwise. Placeholders are in angle brackets.
 
 ### 1. Get the files onto the Pi
 
@@ -48,8 +34,7 @@ git clone https://github.com/tnxqso/sonoff-mqtt /root/sonoff-mqtt
 SRC=/root/sonoff-mqtt/relay
 ```
 
-Or copy the `relay/` directory from a machine that has the repository. On that
-machine:
+Or copy the `relay/` directory from a machine that has the repository. On that machine:
 
 ```sh
 scp -r relay <user>@<pi-address>:/tmp/sonoff-lan-relay-src
@@ -63,8 +48,7 @@ SRC=/tmp/sonoff-lan-relay-src
 
 ### 2. Install the relay and its virtual environment
 
-The service runs as an unprivileged dynamic user, so everything under
-`/opt/sonoff-lan-relay` is owned by root and readable by all.
+The service runs as an unprivileged dynamic user, so everything under `/opt/sonoff-lan-relay` is owned by root and readable by all.
 
 ```sh
 apt install python3-venv
@@ -82,11 +66,7 @@ install -o root -g root -m 0644 "$SRC/sonoff-lan-relay.env.example" /etc/default
 nano /etc/default/sonoff-lan-relay
 ```
 
-Set `RELAY_TARGET` to the IPv4 address of the host running sonoff-mqtt, for
-example `RELAY_TARGET=<sonoff-mqtt-ipv4>`. Change `RELAY_PORT` only if
-`lan_relay.listen_port` in the sonoff-mqtt config differs from 15353. The unit
-does not start without this file, and the relay exits at start if
-`RELAY_TARGET` is empty or not an IPv4 address.
+Set `RELAY_TARGET` to the IPv4 address of the host running sonoff-mqtt, for example `RELAY_TARGET=<sonoff-mqtt-ipv4>`. Change `RELAY_PORT` only if `lan_relay.listen_port` in the sonoff-mqtt config differs from 15353. The unit does not start without this file, and the relay exits at start if `RELAY_TARGET` is empty or not an IPv4 address.
 
 ### 4. Install and start the service
 
@@ -103,29 +83,20 @@ systemctl status sonoff-lan-relay
 journalctl -u sonoff-lan-relay -b --no-pager
 ```
 
-A healthy start logs the target and the run id, then one line per device as it
-is found and sent:
+A healthy start logs the target and the run id, then one line per device as it is found and sent:
 
 ```
 INFO relaying _ewelink._tcp.local. to <sonoff-mqtt-ipv4>:15353, resync every 60 s, run <run-id>
 INFO Added <deviceid> seq=<seq> n=<n>
 ```
 
-Later state changes show as `INFO Updated <deviceid> seq=<seq> n=<n>`, and a
-device that leaves as `INFO Removed <deviceid>`. The resends every 60 s are only
-logged with `--debug`.
+Later state changes show as `INFO Updated <deviceid> seq=<seq> n=<n>`, and a device that leaves as `INFO Removed <deviceid>`. The resends every 60 s are only logged with `--debug`.
 
 Signs of trouble:
 
-- `WARNING sending to <address>:<port> failed: ...`: the path to sonoff-mqtt is
-  down. Only the first failure is logged, then `INFO sending to ... works again`
-  when it recovers.
-- `error: argument --target: not an IPv4 address: ''` and the service
-  stopped with status 2 instead of restarting: `RELAY_TARGET` is not set in
-  `/etc/default/sonoff-lan-relay`. Set it, then run
-  `systemctl restart sonoff-lan-relay`.
-- No `Added` lines at all: the Pi does not see the devices' mDNS, for example
-  because it is on another network or VLAN.
+- `WARNING sending to <address>:<port> failed: ...`: the path to sonoff-mqtt is down. Only the first failure is logged, then `INFO sending to ... works again` when it recovers.
+- `error: argument --target: not an IPv4 address: ''` and the service stopped with status 2 instead of restarting: `RELAY_TARGET` is not set in `/etc/default/sonoff-lan-relay`. Set it, then run `systemctl restart sonoff-lan-relay`.
+- No `Added` lines at all: the Pi does not see the devices' mDNS, for example because it is on another network or VLAN.
 
 On the sonoff-mqtt side, the log shows the first LAN state received per device.
 
@@ -158,11 +129,7 @@ install -o root -g root -m 0644 "$SRC/sonoff-lan-relay.service" /etc/systemd/sys
 systemctl daemon-reload
 ```
 
-Also compare `sonoff-lan-relay.env.example` with `/etc/default/sonoff-lan-relay`
-for new settings. If `/etc/default/sonoff-lan-relay` does not exist (an older
-installation with the target on the ExecStart line), create it as in step 3
-before restarting, or the service will not start. Then check that the installed files match the repository,
-restart and verify:
+Also compare `sonoff-lan-relay.env.example` with `/etc/default/sonoff-lan-relay` for new settings. If `/etc/default/sonoff-lan-relay` does not exist (an older installation with the target on the ExecStart line), create it as in step 3 before restarting, or the service will not start. Then check that the installed files match the repository, restart and verify:
 
 ```sh
 sha256sum "$SRC/mdns_relay.py" /opt/sonoff-lan-relay/mdns_relay.py
@@ -170,18 +137,8 @@ systemctl restart sonoff-lan-relay
 journalctl -u sonoff-lan-relay -b --no-pager -n 50
 ```
 
-Both checksums must be the same. Every start gets a new run id (`run <run-id>`
-in the first log line). sonoff-mqtt notices the new run, logs that the relay
-restarted, and takes the records of the new run as they come.
+Both checksums must be the same. Every start gets a new run id (`run <run-id>` in the first log line). sonoff-mqtt notices the new run, logs that the relay restarted, and takes the records of the new run as they come.
 
 ## Resync interval and the receiver
 
-The relay resends every current record every `RELAY_RESYNC` seconds (60 by
-default, at least 5), so a lost datagram or a restart of sonoff-mqtt heals by
-itself. sonoff-mqtt treats a device address from the relay as fresh for 150 s
-(`ENDPOINT_FRESH_SECONDS` in `src/sonoff_mqtt/lan_relay.py`) and only sends LAN
-commands to a fresh address. 150 s allows two lost resends at the default of
-60. A resync interval above about 75 s leaves no room for a lost resend, and
-one above 150 s makes the addresses go stale between resends, so commands fall
-back to the cloud. Keep `lan_relay.silence_warning_seconds` in the sonoff-mqtt
-config at a few times the resync interval.
+The relay resends every current record every `RELAY_RESYNC` seconds (60 by default, at least 5), so a lost datagram or a restart of sonoff-mqtt heals by itself. sonoff-mqtt treats a device address from the relay as fresh for 150 s (`ENDPOINT_FRESH_SECONDS` in `src/sonoff_mqtt/lan_relay.py`) and only sends LAN commands to a fresh address. 150 s allows two lost resends at the default of 60. A resync interval above about 75 s leaves no room for a lost resend, and one above 150 s makes the addresses go stale between resends, so commands fall back to the cloud. Keep `lan_relay.silence_warning_seconds` in the sonoff-mqtt config at a few times the resync interval.
