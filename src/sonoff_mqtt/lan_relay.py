@@ -41,7 +41,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Optional, Set, Tuple
 
 # 2. Third-party
 import aiohttp
@@ -163,6 +163,13 @@ class LanRelayReceiver(asyncio.DatagramProtocol):
     for good. With the differs rule a Resync carrying the seq already applied is
     a no-op, while a Resync with a new seq, after a lost datagram or a restart
     of this service, is applied.
+
+    On top of that, the relay's boot and n of the last record applied per
+    device filter out a datagram that arrives late within the same relay run:
+    with the same boot, a record whose n is not greater is dropped, Removed
+    included. A different boot is a new relay run, which counts n from 1 again,
+    so its records pass this filter. The seq rule above still applies to
+    everything that passes.
     """
 
     def __init__(self, config: LanRelayConfig, on_state: StateCallback, devicekey_for: KeyLookup):
@@ -176,6 +183,13 @@ class LanRelayReceiver(asyncio.DatagramProtocol):
 
         self._last_seq: Dict[str, str] = {}
         self._last_n: Dict[str, int] = {}
+        # (boot, n) of the last record applied per device, Removed included, so
+        # a late Added from before a removal cannot bring the device back
+        self._last_applied: Dict[str, Tuple[str, int]] = {}
+        # Rejection reasons already logged per device. Cleared when a valid
+        # record from the device is accepted, so the next rejection is logged
+        # again, but a device rejected on every resync does not flood the log
+        self._rejected: Dict[str, Set[str]] = {}
         # Last seq reported per (deviceid, kind), so a failing record is logged
         # once rather than on every resync, without growing without bound
         self._reported: Dict[Tuple[str, str], str] = {}
@@ -264,11 +278,19 @@ class LanRelayReceiver(asyncio.DatagramProtocol):
         if not isinstance(deviceid, str) or not deviceid:
             return
 
+        counter = self._relay_counter(message)
+        if counter is not None and self._is_late(deviceid, str(event), counter):
+            return
+
         if event == "Removed":
             # Forget the seq so the device is applied again when it reappears
             self._last_seq.pop(deviceid, None)
             # And its address, so no LAN command goes to a device that has left
             self._endpoints.pop(deviceid, None)
+            # But keep boot and n, so a late record from before the removal is
+            # still recognised as late
+            if counter is not None:
+                self._last_applied[deviceid] = counter
             _LOGGER.info("LAN relay: %s left mDNS", deviceid)
             return
 
@@ -277,9 +299,83 @@ class LanRelayReceiver(asyncio.DatagramProtocol):
             _LOGGER.warning("LAN relay: %s %s without a txt object", event, deviceid)
             return
 
+        devicekey = self.devicekey_for(deviceid)
+        if not self._is_valid_record(deviceid, str(event), txt, devicekey):
+            return
+        self._rejected.pop(deviceid, None)
+        if counter is not None:
+            self._last_applied[deviceid] = counter
+
         # Before _handle_record, which returns early on an unchanged seq
         self._remember_endpoint(deviceid, message)
-        self._handle_record(deviceid, str(event), txt)
+        self._handle_record(deviceid, str(event), txt, devicekey)
+
+    @staticmethod
+    def _relay_counter(message: Dict[str, Any]) -> Optional[Tuple[str, int]]:
+        """The (boot, n) of a datagram, or None when either is missing or invalid."""
+        boot, n = message.get("boot"), message.get("n")
+        if not isinstance(boot, str) or isinstance(n, bool) or not isinstance(n, int):
+            return None
+        return boot, n
+
+    def _is_late(self, deviceid: str, event: str, counter: Tuple[str, int]) -> bool:
+        """True for a record of the same relay run that is not newer than the last applied."""
+        last = self._last_applied.get(deviceid)
+        if last is None or last[0] != counter[0] or counter[1] > last[1]:
+            return False
+        _LOGGER.debug(
+            "LAN relay: %s %s n=%d dropped, n=%d of run %s already applied",
+            event, deviceid, counter[1], last[1], counter[0],
+        )
+        return True
+
+    def _is_valid_record(
+        self, deviceid: str, event: str, txt: Dict[str, Any], devicekey: Optional[str]
+    ) -> bool:
+        """Check a record carrying TXT before any of it is used.
+
+        A record that fails is ignored as a whole: no address, port, seq or
+        state is taken from it.
+        """
+        txt_id = txt.get("id")
+        if not txt_id:
+            return self._reject(
+                deviceid, "id missing",
+                "LAN relay: %s %s without a txt id, record ignored", event, deviceid,
+            )
+        if txt_id != deviceid:
+            return self._reject(
+                deviceid, "id mismatch",
+                "LAN relay: %s %s with a txt id for another device, record ignored",
+                event, deviceid,
+            )
+
+        # The Esered LAN is treated as trusted. This check only stops plaintext
+        # records for a device that encrypts; a replay of an old ciphertext
+        # with a new seq is still possible, as the payload is AES-CBC without a
+        # MAC. That is an accepted risk.
+        if devicekey and txt.get("encrypt") != "true":
+            return self._reject(
+                deviceid, "plaintext",
+                "LAN relay: %s %s is not encrypted although the device has a devicekey, "
+                "record ignored", event, deviceid,
+            )
+
+        seq = txt.get("seq")
+        if seq is None or str(seq) == "":
+            return self._reject(
+                deviceid, "seq missing",
+                "LAN relay: %s %s without a seq, record ignored", event, deviceid,
+            )
+        return True
+
+    def _reject(self, deviceid: str, reason: str, msg: str, *args) -> bool:
+        """Log a rejected record once per device and reason. Always returns False."""
+        reported = self._rejected.setdefault(deviceid, set())
+        if reason not in reported:
+            reported.add(reason)
+            _LOGGER.warning(msg, *args)
+        return False
 
     def _remember_endpoint(self, deviceid: str, message: Dict[str, Any]) -> None:
         """Keep the first IPv4 address and the port from a relay record."""
@@ -323,12 +419,13 @@ class LanRelayReceiver(asyncio.DatagramProtocol):
             _LOGGER.info("LAN relay: %d datagram(s) lost", n - previous - 1)
         self._last_n[boot] = n
 
-    def _handle_record(self, deviceid: str, event: str, txt: Dict[str, Any]) -> None:
+    def _handle_record(
+        self, deviceid: str, event: str, txt: Dict[str, Any], devicekey: Optional[str]
+    ) -> None:
         seq = str(txt.get("seq"))
         if self._last_seq.get(deviceid) == seq:
             return
 
-        devicekey = self.devicekey_for(deviceid)
         if not devicekey:
             self._report_once(
                 "unknown", deviceid, seq, logging.DEBUG,
@@ -349,12 +446,8 @@ class LanRelayReceiver(asyncio.DatagramProtocol):
 
         raw = "".join(str(txt[f"data{i}"]) for i in range(1, DATA_FIELDS + 1) if f"data{i}" in txt)
         try:
-            if txt.get("encrypt") == "true":
-                params = decrypt_params(raw, str(txt.get("iv", "")), devicekey)
-            else:
-                params = json.loads(raw) if raw else {}
-                if not isinstance(params, dict):
-                    raise ValueError("plaintext payload is not an object")
+            # _is_valid_record lets a record through only encrypted when there is a devicekey
+            params = decrypt_params(raw, str(txt.get("iv", "")), devicekey)
         except Exception as e:  # report the failure type only, never the payload
             self._report_once(
                 "decrypt", deviceid, seq, logging.WARNING,

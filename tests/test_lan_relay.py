@@ -63,6 +63,32 @@ def record(deviceid: str, seq: int, params: Dict[str, Any], n: int,
     return json.dumps(message).encode()
 
 
+def with_txt(datagram: bytes, **changes: Any) -> bytes:
+    """A relay datagram with TXT fields replaced, or removed when given None."""
+    message = json.loads(datagram)
+    for key, value in changes.items():
+        if value is None:
+            message["txt"].pop(key, None)
+        else:
+            message["txt"][key] = value
+    return json.dumps(message).encode()
+
+
+def plaintext(deviceid: str, seq: int, params: Dict[str, Any], n: int,
+              event: str = "Updated", boot: str = "run1") -> bytes:
+    """A relay datagram as a device without encryption sends it."""
+    message = {"v": 1, "boot": boot, "n": n, "event": event, "ts": 0.0,
+               "name": f"eWeLink_{deviceid}._ewelink._tcp.local.", "deviceid": deviceid,
+               "addresses": ["192.168.100.66"], "port": 8081,
+               "txt": {"data1": json.dumps(params), "id": deviceid, "seq": str(seq)}}
+    return json.dumps(message).encode()
+
+
+def removed(deviceid: str, n: int, boot: str = "run1") -> bytes:
+    return json.dumps({"v": 1, "boot": boot, "n": n, "event": "Removed", "ts": 0.0,
+                       "name": "x", "deviceid": deviceid}).encode()
+
+
 class Collector:
     def __init__(self):
         self.calls: List[Tuple[str, Dict[str, Any], str, str]] = []
@@ -141,6 +167,163 @@ class ReceiverTests(unittest.TestCase):
         with self.assertLogs("sonoff_mqtt.lan_relay", level="INFO") as logs:
             receiver.datagram_received(record("10020db9d1", 2, {"switch": "on"}, 4), (RELAY, 5000))
         self.assertIn("2 datagram(s) lost", logs.output[0])
+
+
+class RecordCheckTests(unittest.TestCase):
+    """Records carrying TXT are checked as a whole before any of them is used."""
+
+    def setUp(self):
+        self.collector = Collector()
+        self.receiver = make_receiver(self.collector)
+
+    def feed(self, datagram: bytes):
+        self.receiver.datagram_received(datagram, (RELAY, 5000))
+
+    def test_plaintext_for_device_with_devicekey_is_rejected(self):
+        self.feed(record("10020db9d1", 1, {"switch": "on"}, 1, "Added"))
+        with self.assertLogs("sonoff_mqtt.lan_relay", level="WARNING") as logs:
+            self.feed(plaintext("10020db9d1", 2, {"switch": "off"}, 2))
+        self.assertIn("is not encrypted although the device has a devicekey", logs.output[0])
+        self.assertEqual([c[2] for c in self.collector.calls], ["1"])
+        self.assertEqual(self.receiver.endpoint_for("10020db9d1"), ("192.168.100.243", 8081))
+        self.assertEqual(self.receiver._last_seq["10020db9d1"], "1")
+        self.assertEqual(self.receiver._last_applied["10020db9d1"], ("run1", 1))
+
+    def test_encrypted_for_device_with_devicekey_is_accepted(self):
+        with self.assertNoLogs("sonoff_mqtt.lan_relay", level="WARNING"):
+            self.feed(record("10020db9d1", 1, {"switch": "on"}, 1, "Added"))
+        self.assertEqual([(c[2], c[1]) for c in self.collector.calls], [("1", {"switch": "on"})])
+        self.assertEqual(self.receiver.endpoint_for("10020db9d1"), ("192.168.100.243", 8081))
+
+    def test_plaintext_for_device_without_devicekey_keeps_endpoint_only(self):
+        # As before: the record is not rejected, so the endpoint is kept, but
+        # no state is handed on for a device without a devicekey
+        with self.assertNoLogs("sonoff_mqtt.lan_relay", level="WARNING"):
+            self.feed(plaintext("ffffffffff", 1, {"switch": "on"}, 1, "Added"))
+        self.assertEqual(self.collector.calls, [])
+        self.assertEqual(self.receiver.endpoint_for("ffffffffff"), ("192.168.100.66", 8081))
+
+    def test_missing_txt_id_is_rejected(self):
+        with self.assertLogs("sonoff_mqtt.lan_relay", level="WARNING") as logs:
+            self.feed(with_txt(record("10020db9d1", 1, {"switch": "on"}, 1, "Added"), id=None))
+        self.assertIn("without a txt id", logs.output[0])
+        self.assertEqual(self.collector.calls, [])
+        self.assertIsNone(self.receiver.endpoint_for("10020db9d1"))
+        self.assertNotIn("10020db9d1", self.receiver._last_applied)
+
+    def test_mismatched_txt_id_is_rejected(self):
+        with self.assertLogs("sonoff_mqtt.lan_relay", level="WARNING") as logs:
+            self.feed(with_txt(record("10020db9d1", 1, {"switch": "on"}, 1, "Added"), id="1001d504c3"))
+        self.assertIn("txt id for another device", logs.output[0])
+        self.assertEqual(self.collector.calls, [])
+        self.assertIsNone(self.receiver.endpoint_for("10020db9d1"))
+
+    def test_missing_seq_is_rejected_and_logged_once_until_a_valid_record(self):
+        no_seq = lambda n, **kw: with_txt(record("10020db9d1", 1, {"switch": "on"}, n), **kw)
+        with self.assertLogs("sonoff_mqtt.lan_relay", level="WARNING") as logs:
+            self.feed(no_seq(1, seq=None))
+            self.feed(no_seq(2, seq=""))
+            self.feed(no_seq(3, seq=None))
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("without a seq", logs.output[0])
+        self.assertEqual(self.collector.calls, [])
+        self.assertIsNone(self.receiver.endpoint_for("10020db9d1"))
+
+        # A valid record re-arms the warning
+        self.feed(record("10020db9d1", 5, {"switch": "on"}, 4))
+        self.assertEqual([c[2] for c in self.collector.calls], ["5"])
+        with self.assertLogs("sonoff_mqtt.lan_relay", level="WARNING") as logs:
+            self.feed(no_seq(5, seq=None))
+            self.feed(no_seq(6, seq=None))
+        self.assertEqual(len(logs.output), 1)
+        self.assertEqual([c[2] for c in self.collector.calls], ["5"])
+
+    def test_rejections_are_logged_once_per_reason(self):
+        with self.assertLogs("sonoff_mqtt.lan_relay", level="WARNING") as logs:
+            self.feed(plaintext("10020db9d1", 1, {"switch": "on"}, 1))
+            self.feed(plaintext("10020db9d1", 2, {"switch": "on"}, 2))
+            self.feed(with_txt(record("10020db9d1", 3, {"switch": "on"}, 3), seq=None))
+        self.assertEqual(len(logs.output), 2)
+
+    def test_removed_needs_no_txt_or_seq(self):
+        self.feed(record("10020db9d1", 1, {"switch": "on"}, 1, "Added"))
+        with self.assertNoLogs("sonoff_mqtt.lan_relay", level="WARNING"):
+            self.feed(removed("10020db9d1", 2))
+        self.assertIsNone(self.receiver.endpoint_for("10020db9d1"))
+
+
+class RelayCounterTests(unittest.TestCase):
+    """Late datagrams within one relay run, by the relay's boot and n."""
+
+    def setUp(self):
+        self.collector = Collector()
+        self.receiver = make_receiver(self.collector)
+
+    def feed(self, datagram: bytes):
+        self.receiver.datagram_received(datagram, (RELAY, 5000))
+
+    def seqs(self):
+        return [c[2] for c in self.collector.calls]
+
+    def test_same_boot_lower_or_equal_n_is_dropped(self):
+        self.feed(record("10020db9d1", 10, {"switch": "on"}, 5))
+        with self.assertLogs("sonoff_mqtt.lan_relay", level="DEBUG") as logs:
+            self.feed(record("10020db9d1", 9, {"switch": "off"}, 4))
+            self.feed(with_txt(record("10020db9d1", 11, {"switch": "off"}, 5), port=1))
+        self.assertTrue(all("dropped" in line for line in logs.output))
+        self.assertEqual(self.seqs(), ["10"])
+        self.assertEqual(self.receiver._last_seq["10020db9d1"], "10")
+        self.assertEqual(self.receiver._last_applied["10020db9d1"], ("run1", 5))
+
+    def test_same_boot_higher_n_is_applied(self):
+        self.feed(record("10020db9d1", 10, {"switch": "on"}, 5))
+        self.feed(record("10020db9d1", 11, {"switch": "off"}, 6))
+        self.assertEqual(self.seqs(), ["10", "11"])
+        self.assertEqual(self.receiver._last_applied["10020db9d1"], ("run1", 6))
+
+    def test_late_datagram_does_not_move_endpoint(self):
+        self.feed(record("10020db9d1", 10, {"switch": "on"}, 5))
+        late = json.loads(record("10020db9d1", 10, {"switch": "on"}, 3, "Resync"))
+        late["addresses"] = ["192.168.100.99"]
+        self.feed(json.dumps(late).encode())
+        self.assertEqual(self.receiver.endpoint_for("10020db9d1"), ("192.168.100.243", 8081))
+
+    def test_new_boot_with_lower_n_is_applied(self):
+        self.feed(record("10020db9d1", 10, {"switch": "on"}, 50))
+        self.feed(record("10020db9d1", 11, {"switch": "off"}, 1, "Added", boot="run2"))
+        self.assertEqual(self.seqs(), ["10", "11"])
+        self.assertEqual(self.receiver._last_applied["10020db9d1"], ("run2", 1))
+
+    def test_late_added_after_removed_does_not_revive(self):
+        self.feed(record("10020db9d1", 10, {"switch": "on"}, 5, "Added"))
+        self.feed(removed("10020db9d1", 7))
+        self.feed(record("10020db9d1", 10, {"switch": "on"}, 6, "Added"))
+        self.assertEqual(self.seqs(), ["10"])
+        self.assertIsNone(self.receiver.endpoint_for("10020db9d1"))
+        self.assertNotIn("10020db9d1", self.receiver._last_seq)
+        # A newer record after the removal is applied, the same seq included
+        self.feed(record("10020db9d1", 10, {"switch": "on"}, 8, "Added"))
+        self.assertEqual(self.seqs(), ["10", "10"])
+
+    def test_late_removed_is_dropped(self):
+        self.feed(record("10020db9d1", 10, {"switch": "on"}, 5))
+        self.feed(removed("10020db9d1", 4))
+        self.assertEqual(self.receiver.endpoint_for("10020db9d1"), ("192.168.100.243", 8081))
+        self.assertEqual(self.receiver._last_seq["10020db9d1"], "10")
+
+    def test_seq_differs_rule_holds_across_boot_change(self):
+        self.feed(record("10020db9d1", 10, {"switch": "on"}, 50))
+        # New relay run, same seq: refreshes the endpoint, applies nothing
+        self.feed(record("10020db9d1", 10, {"switch": "on"}, 1, "Added", boot="run2"))
+        self.assertEqual(self.seqs(), ["10"])
+        # New relay run, lower seq: applied, as the seq only has to differ
+        self.feed(record("10020db9d1", 3, {"switch": "off"}, 2, boot="run2"))
+        self.assertEqual(self.seqs(), ["10", "3"])
+
+    def test_counter_is_per_device(self):
+        self.feed(record("10020db9d1", 10, {"switch": "on"}, 5))
+        self.feed(record("1001d504c3", 20, {"switch": "on"}, 3))
+        self.assertEqual(self.seqs(), ["10", "20"])
 
 
 class FakeMqtt:
