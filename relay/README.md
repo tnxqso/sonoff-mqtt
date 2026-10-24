@@ -19,7 +19,7 @@ For the full background see the top-level `README.md` of this repository. The da
 - `python3-venv`, to create the relay's own virtual environment.
 - The Pi must be on the same network (link) as the devices.
 - The network path from the Pi to the host running sonoff-mqtt must allow UDP to the receiver port (15353 by default), including any firewall in between.
-- sonoff-mqtt must have the relay enabled and accept the Pi as a source. In its config, under `lan_relay`: `enabled: true`, `listen_port` equal to the relay's port, and the Pi's address in `allowed_sources` (addresses, not host names). Use the address the datagrams arrive from as seen by sonoff-mqtt, which differs from the Pi's LAN address if they pass through NAT or a tunnel. See `config/config.example.yml`.
+- sonoff-mqtt must have the relay enabled and accept the Pi as a source. In its config, under `lan_relay`: `enabled: true`, `listen_port` equal to the relay's port, and the Pi's address in `allowed_sources` (IPv4 addresses, not host names). With several relays, for example one per site, each has its own entry there. sonoff-mqtt knows a relay only by this address, so each Pi needs a fixed one, for example a DHCP reservation. Use the address the datagrams arrive from as seen by sonoff-mqtt, which differs from the Pi's LAN address if they pass through NAT or a tunnel. See `config/config.example.yml`.
 
 ## Installation on a new Pi
 
@@ -83,10 +83,11 @@ systemctl status sonoff-lan-relay
 journalctl -u sonoff-lan-relay -b --no-pager
 ```
 
-A healthy start logs the target and the run id, then one line per device as it is found and sent:
+A healthy start logs the target and the run id, the IPv4 addresses the relay listens on, then one line per device as it is found and sent:
 
 ```
 INFO relaying _ewelink._tcp.local. to <sonoff-mqtt-ipv4>:15353, resync every 60 s, run <run-id>
+INFO IPv4 addresses: 127.0.0.1, <pi-lan-ipv4>
 INFO Added <deviceid> seq=<seq> n=<n>
 ```
 
@@ -97,8 +98,21 @@ Signs of trouble:
 - `WARNING sending to <address>:<port> failed: ...`: the path to sonoff-mqtt is down. Only the first failure is logged, then `INFO sending to ... works again` when it recovers.
 - `error: argument --target: not an IPv4 address: ''` and the service stopped with status 2 instead of restarting: `RELAY_TARGET` is not set in `/etc/default/sonoff-lan-relay`. Set it, then run `systemctl restart sonoff-lan-relay`.
 - No `Added` lines at all: the Pi does not see the devices' mDNS, for example because it is on another network or VLAN.
+- `WARNING no IPv4 address yet, waiting before joining mDNS`: the relay started before the Pi had an IPv4 address other than loopback. It checks every 15 s and logs `INFO IPv4 address found, joining mDNS` when one appears. If it keeps waiting, the Pi's network is not up.
+- `WARNING IPv4 addresses changed (<old> -> <new>), exiting so systemd restarts the relay`, then a new start: expected after an address change, see Network addresses below. Repeated after every restart, it points to an interface whose address keeps coming and going.
+- `WARNING zeroconf could not start (...), exiting so systemd restarts the relay`: zeroconf found no interface to listen on. systemd starts the relay again after 10 s.
+- `WARNING listing the network interfaces failed: ...`: the relay could not read the interface addresses and treats that as none. Logged once, then `INFO listing the network interfaces works again`.
 
 On the sonoff-mqtt side, the log shows the first LAN state received per device.
+
+## Network addresses
+
+zeroconf, the mDNS library the relay uses, reads the Pi's IPv4 addresses only once, when it starts, and joins mDNS on each of them. An address that appears later is never used, so a relay started before the Pi's network was up would stay deaf for good. The relay therefore:
+
+- Waits at start until the Pi has an IPv4 address outside 127.0.0.0/8, checking every 15 s, before it starts zeroconf.
+- Then checks the IPv4 addresses on all interfaces every 15 s. On any change it stops and exits with status 75, and systemd starts it again after `RestartSec=10` with the new addresses. Status 75 is never treated as an argument error (status 2), so the unit always restarts it.
+
+The gap is about 10 s plus the time to find the devices again, well inside the 150 s for which sonoff-mqtt treats a device address as fresh, so LAN commands keep working through it. The check covers every interface zeroconf listens on, so an IPv4 change on any of them restarts the relay, also one on a VPN or a container bridge that has nothing to do with the devices.
 
 ## Upgrade
 
@@ -137,7 +151,9 @@ systemctl restart sonoff-lan-relay
 journalctl -u sonoff-lan-relay -b --no-pager -n 50
 ```
 
-Both checksums must be the same. Every start gets a new run id (`run <run-id>` in the first log line). sonoff-mqtt notices the new run, logs that the relay restarted, and takes the records of the new run as they come.
+Both checksums must be the same. Every start gets a new run id (`run <run-id>` in the first log line). sonoff-mqtt notices the new run, logs `LAN relay <relay-address>: relay restarted (run <run-id>, was <run-id>)`, and takes the records of the new run as they come.
+
+If a NetworkManager dispatcher script or something similar was installed to restart the relay when the network came up, it is no longer needed: the relay now waits for an address and restarts itself when the addresses change. Remove it after the upgrade.
 
 ## Resync interval and the receiver
 

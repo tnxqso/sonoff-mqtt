@@ -10,13 +10,13 @@ EXCEPT the one that caused the change, so while another client is driving these
 devices this process sees everything it does, but it does not see echoes of its
 own commands and has to read state back with a query instead.
 
-Optionally, state also arrives from an mDNS relay on the devices' own network
-(see lan_relay.py). That is a second, independent view of the same devices and
-goes through the same merge-and-publish path, so a change reported by both the
-cloud and the LAN is published once.
+Optionally, state also arrives from one or more mDNS relays, each on the
+devices' own network (see lan_relay.py). That is a second, independent view of
+the same devices and goes through the same merge-and-publish path, so a change
+reported by both the cloud and the LAN is published once.
 
 For devices listed in lan_relay.command_devices, commands are sent over the LAN
-first and confirmed by the relay (see _try_lan_command). The cloud path with its
+first and confirmed by a relay (see _try_lan_command). The cloud path with its
 read-back stays in place as the fallback for every command that is not.
 """
 

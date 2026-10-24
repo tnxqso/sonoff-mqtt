@@ -12,6 +12,13 @@ documented in sonoff-mqtt, src/sonoff_mqtt/lan_relay.py (protocol version 1).
 
 Runs until stopped (SIGTERM or SIGINT) unless --duration is given. Logs to
 stdout, which systemd sends to the journal.
+
+zeroconf reads the host's IPv4 addresses only once, when it is constructed, and
+joins the mDNS group on each of them; it never notices an address that appears
+later. So the relay waits for an IPv4 address outside 127.0.0.0/8 before it
+starts zeroconf, and then checks the addresses every
+ADDRESS_CHECK_INTERVAL_SECONDS. On any change it stops and exits with
+EXIT_ADDRESSES_CHANGED, and systemd starts it again with the new addresses.
 """
 
 # 1. Standard library
@@ -25,9 +32,10 @@ import socket
 import sys
 import time
 import uuid
-from typing import Optional
+from typing import FrozenSet, Optional
 
 # 2. Third-party
+import ifaddr
 from zeroconf import ServiceStateChange, Zeroconf
 from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo, AsyncZeroconf
 
@@ -42,6 +50,14 @@ PROTOCOL_VERSION = 1
 SAFE_PAYLOAD_BYTES = 1392
 # Lower bound for --resync, so a typo cannot make the relay flood the path home
 MIN_RESYNC_SECONDS = 5
+# How often the IPv4 addresses are checked, while waiting for the first one and
+# while running
+ADDRESS_CHECK_INTERVAL_SECONDS = 15
+# Exit status when the addresses changed or zeroconf found none to listen on.
+# EX_TEMPFAIL from sysexits.h; never 2, which the systemd unit treats as an
+# argument error that a restart cannot fix (RestartPreventExitStatus=2).
+EXIT_ADDRESSES_CHANGED = 75
+_LOOPBACK = ipaddress.IPv4Network("127.0.0.0/8")
 
 
 def deviceid_from_name(name: str) -> Optional[str]:
@@ -57,6 +73,81 @@ def deviceid_from_name(name: str) -> Optional[str]:
     if not instance.startswith(INSTANCE_PREFIX):
         return None
     return instance[len(INSTANCE_PREFIX):] or None
+
+
+class Addresses:
+    """The host's IPv4 addresses as zeroconf sees them when it is constructed."""
+
+    def __init__(self):
+        # A failure to list the interfaces is logged on the first one and on
+        # recovery only, as the check runs every ADDRESS_CHECK_INTERVAL_SECONDS
+        self.failing = False
+
+    def current(self) -> FrozenSet[str]:
+        """The IPv4 addresses on all interfaces; empty when they cannot be listed.
+
+        Copies zeroconf 0.151.5 get_all_addresses_ipv4 (zeroconf/_utils/net.py),
+        which InterfaceChoice.All uses at construction, on purpose instead of
+        importing that private module: loopback, /32 and link-local addresses
+        are included, IPv6 is not. A change of the zeroconf version must check
+        that this still matches.
+        """
+        try:
+            adapters = ifaddr.get_adapters()
+        except OSError as e:
+            if not self.failing:
+                self.failing = True
+                _LOGGER.warning("listing the network interfaces failed: %s: %s", type(e).__name__, e)
+            return frozenset()
+        if self.failing:
+            self.failing = False
+            _LOGGER.info("listing the network interfaces works again")
+        return frozenset(ip.ip for adapter in adapters for ip in adapter.ips if ip.is_IPv4)
+
+
+def has_usable_address(addresses: FrozenSet[str]) -> bool:
+    """Whether any address is outside 127.0.0.0/8, so mDNS can reach the LAN."""
+    return any(ipaddress.IPv4Address(address) not in _LOOPBACK for address in addresses)
+
+
+def format_addresses(addresses: FrozenSet[str]) -> str:
+    return ", ".join(sorted(addresses, key=ipaddress.IPv4Address)) or "none"
+
+
+async def stopped_within(stop: asyncio.Event, seconds: float) -> bool:
+    """Wait up to seconds; True as soon as stop is set, False on the timeout."""
+    try:
+        await asyncio.wait_for(stop.wait(), seconds)
+    except asyncio.TimeoutError:
+        return False
+    return True
+
+
+async def wait_for_address(addresses: Addresses, stop: asyncio.Event) -> Optional[FrozenSet[str]]:
+    """The current addresses once one is outside 127.0.0.0/8, or None when stopped first."""
+    current = addresses.current()
+    if has_usable_address(current):
+        return current
+    _LOGGER.warning("no IPv4 address yet, waiting before joining mDNS")
+    while True:
+        if await stopped_within(stop, ADDRESS_CHECK_INTERVAL_SECONDS):
+            return None
+        current = addresses.current()
+        if has_usable_address(current):
+            _LOGGER.info("IPv4 address found, joining mDNS")
+            return current
+
+
+async def watch_addresses(addresses: Addresses, baseline: FrozenSet[str], stop: asyncio.Event) -> bool:
+    """Set stop and return True once the addresses differ from baseline."""
+    while True:
+        await asyncio.sleep(ADDRESS_CHECK_INTERVAL_SECONDS)
+        current = addresses.current()
+        if current != baseline:
+            _LOGGER.warning("IPv4 addresses changed (%s -> %s), exiting so systemd restarts the relay",
+                            format_addresses(baseline), format_addresses(current))
+            stop.set()
+            return True
 
 
 class Relay:
@@ -176,9 +267,30 @@ async def run(target: str, port: int, duration: int, resync: int) -> int:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
 
-    aiozc = AsyncZeroconf()
+    # zeroconf joins mDNS only on the addresses present when it is constructed,
+    # so it is not started before there is one beyond loopback
+    addresses = Addresses()
+    baseline = await wait_for_address(addresses, stop)
+    if baseline is None:
+        relay.sock.close()
+        _LOGGER.info("stopped before joining mDNS, run %s", relay.boot)
+        return 0
+    # The baseline is the snapshot taken last, with no await between it and the
+    # construction below, so zeroconf's own scan cannot see an address the
+    # watch does not know about
+    _LOGGER.info("IPv4 addresses: %s", format_addresses(baseline))
+    try:
+        aiozc = AsyncZeroconf()
+    except RuntimeError as e:
+        # Raised when zeroconf finds no interface at all to listen on
+        _LOGGER.warning("zeroconf could not start (%s), exiting so systemd restarts the relay", e)
+        relay.sock.close()
+        return EXIT_ADDRESSES_CHANGED
     browser = AsyncServiceBrowser(aiozc.zeroconf, SERVICE_TYPE, handlers=[relay.on_change])
     resync_task = asyncio.create_task(relay.resync_loop(resync))
+    # zeroconf runs on this event loop (it attaches to the running loop when
+    # constructed inside one), so the watch needs no locking
+    watch_task = asyncio.create_task(watch_addresses(addresses, baseline, stop))
     try:
         if duration > 0:
             try:
@@ -191,7 +303,7 @@ async def run(target: str, port: int, duration: int, resync: int) -> int:
         # No new resolves once the browser is gone; then stop and wait for the
         # ones in flight and the resync, so nothing is cut off by the close
         await browser.async_cancel()
-        pending = [resync_task, *relay.tasks]
+        pending = [resync_task, watch_task, *relay.tasks]
         for task in pending:
             task.cancel()
         # return_exceptions, so the cancellations do not propagate or log
@@ -199,6 +311,9 @@ async def run(target: str, port: int, duration: int, resync: int) -> int:
         await aiozc.async_close()
         relay.sock.close()
     _LOGGER.info("stopped, %d datagram(s) sent in run %s", relay.counter, relay.boot)
+    # cancel() leaves a task that had already finished as it was
+    if not watch_task.cancelled() and watch_task.exception() is None and watch_task.result():
+        return EXIT_ADDRESSES_CHANGED
     return 0
 
 

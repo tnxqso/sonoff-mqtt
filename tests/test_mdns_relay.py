@@ -1,11 +1,12 @@
 """Offline tests for the mDNS relay in relay/mdns_relay.py.
 
-zeroconf is not installed where these tests run, and is not needed: the
-modules the relay imports from it are replaced by small stubs in sys.modules
-before the relay is loaded from its file path (relay/ is not a package). The
-tests then swap in fakes for AsyncServiceInfo, AsyncServiceBrowser and
-AsyncZeroconf where they need them. The contract test sends real datagrams over
-localhost to a real LanRelayReceiver.
+zeroconf and ifaddr are not installed where these tests run, and are not
+needed: the modules the relay imports from them are replaced by small stubs in
+sys.modules before the relay is loaded from its file path (relay/ is not a
+package). The tests then swap in fakes for AsyncServiceInfo,
+AsyncServiceBrowser and AsyncZeroconf, and the adapters ifaddr reports, where
+they need them. The contract test sends real datagrams over localhost to a real
+LanRelayReceiver.
 
 Usage:
     PYTHONPATH=src .venv/bin/python -m unittest tests/test_mdns_relay.py -v
@@ -18,6 +19,7 @@ import enum
 import importlib.util
 import io
 import json
+import signal
 import socket
 import sys
 import types
@@ -54,8 +56,52 @@ class _Unused:
         raise AssertionError(f"{type(self).__name__} stub used without a fake")
 
 
+class IP:
+    """ifaddr 0.2.0 IP: a str for IPv4, an (ip, flowinfo, scope_id) tuple for IPv6."""
+
+    def __init__(self, ip, network_prefix: int, nice_name: str) -> None:
+        self.ip = ip
+        self.network_prefix = network_prefix
+        self.nice_name = nice_name
+
+    @property
+    def is_IPv4(self) -> bool:
+        return not isinstance(self.ip, tuple)
+
+    @property
+    def is_IPv6(self) -> bool:
+        return isinstance(self.ip, tuple)
+
+
+class Adapter:
+    """ifaddr 0.2.0 Adapter; on Linux nice_name is the same as name."""
+
+    def __init__(self, name: str, nice_name: str, ips: List[IP], index: Optional[int] = None) -> None:
+        self.name = name
+        self.nice_name = nice_name
+        self.ips = ips
+        self.index = index
+
+
+def adapter(name: str, *ips: Tuple[Any, int], index: Optional[int] = None) -> Adapter:
+    return Adapter(name, name, [IP(ip, prefix, name) for ip, prefix in ips], index=index)
+
+
+# What the ifaddr stub reports unless a test replaces it: loopback, one LAN
+# address and an IPv6 link-local one, as on a typical host
+DEFAULT_ADAPTERS = [
+    adapter("lo", ("127.0.0.1", 8), (("::1", 0, 0), 128), index=1),
+    adapter("eth0", ("192.0.2.50", 24), (("fe80::1", 0, 2), 64), index=2),
+]
+
+
+def _get_adapters(include_unconfigured: bool = False):
+    # ifaddr returns the values view of a dict keyed by adapter name
+    return {a.name: a for a in DEFAULT_ADAPTERS}.values()
+
+
 def _stub_modules() -> Dict[str, types.ModuleType]:
-    """Exactly the modules relay/mdns_relay.py imports from zeroconf."""
+    """Exactly the modules relay/mdns_relay.py imports from zeroconf and ifaddr."""
     zeroconf = types.ModuleType("zeroconf")
     zeroconf.ServiceStateChange = ServiceStateChange
     zeroconf.Zeroconf = type("Zeroconf", (_Unused,), {})
@@ -63,7 +109,11 @@ def _stub_modules() -> Dict[str, types.ModuleType]:
     for name in ("AsyncServiceBrowser", "AsyncServiceInfo", "AsyncZeroconf"):
         setattr(zeroconf_asyncio, name, type(name, (_Unused,), {}))
     zeroconf.asyncio = zeroconf_asyncio
-    return {"zeroconf": zeroconf, "zeroconf.asyncio": zeroconf_asyncio}
+    ifaddr = types.ModuleType("ifaddr")
+    ifaddr.IP = IP
+    ifaddr.Adapter = Adapter
+    ifaddr.get_adapters = _get_adapters
+    return {"zeroconf": zeroconf, "zeroconf.asyncio": zeroconf_asyncio, "ifaddr": ifaddr}
 
 
 _STUBS = _stub_modules()
@@ -78,7 +128,7 @@ _spec.loader.exec_module(relay_mod)
 
 def tearDownModule():
     # The loaded relay keeps its own references to the stubs, so removing them
-    # here does not affect it, only later imports of zeroconf
+    # here does not affect it, only later imports of zeroconf or ifaddr
     for name, module in _SAVED_MODULES.items():
         if module is None:
             sys.modules.pop(name, None)
@@ -512,6 +562,20 @@ class MainTests(unittest.TestCase):
         self.assertEqual(run_args[0], "198.51.100.7")
         self.assertIsInstance(run_args[0], str)
 
+    def test_exit_status_of_run_is_returned(self):
+        async def fake_run(*run_args):
+            return relay_mod.EXIT_ADDRESSES_CHANGED
+
+        with mock.patch.object(sys, "argv", ["mdns_relay.py", "--target", "192.0.2.10"]), \
+                mock.patch.object(relay_mod, "run", fake_run), \
+                mock.patch.object(relay_mod.logging, "basicConfig"):
+            self.assertEqual(relay_mod.main(), 75)
+
+    def test_exit_status_for_changed_addresses_is_not_the_argument_error(self):
+        # The systemd unit has RestartPreventExitStatus=2
+        self.assertEqual(relay_mod.EXIT_ADDRESSES_CHANGED, 75)
+        self.assertNotEqual(relay_mod.EXIT_ADDRESSES_CHANGED, 2)
+
     def test_help_mentions_the_receiver_freshness(self):
         stdout = io.StringIO()
         with mock.patch.object(sys, "argv", ["mdns_relay.py", "--help"]), \
@@ -566,6 +630,226 @@ class RunShutdownTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sorted(events[1:3]), ["resolve cancelled", "resync cancelled"])
         self.assertEqual(events[3:], ["close"])
         self.assertIn("stopped, 0 datagram(s) sent", logs.output[-1])
+
+
+# ==============================================================================
+# IPv4 addresses: waiting for the first one, and exiting when they change
+# ==============================================================================
+
+LOOPBACK_ONLY = [adapter("lo", ("127.0.0.1", 8), (("::1", 0, 0), 128), index=1)]
+BASE = LOOPBACK_ONLY + [adapter("eth0", ("192.0.2.50", 24), index=2)]
+CHANGED = LOOPBACK_ONLY + [adapter("eth0", ("192.0.2.60", 24), index=2)]
+
+
+class AdapterSequence:
+    """Replaces ifaddr.get_adapters: one step per call, the last one repeated.
+
+    A step is a list of adapters, or an exception to raise. Every call is noted
+    in events, so a test can check the order against zeroconf's construction.
+    """
+
+    def __init__(self, events: List[str], *steps):
+        self.events = events
+        self.steps = list(steps)
+        self.calls = 0
+
+    def __call__(self, include_unconfigured: bool = False):
+        step = self.steps[min(self.calls, len(self.steps) - 1)]
+        self.calls += 1
+        self.events.append("addresses read")
+        if isinstance(step, BaseException):
+            raise step
+        return {a.name: a for a in step}.values()
+
+
+class AddressSetTests(unittest.TestCase):
+    def test_address_set_equals_zeroconfs_expression(self):
+        adapters = [
+            adapter("lo", ("127.0.0.1", 8), (("::1", 0, 0), 128), index=1),
+            adapter("eth0", ("192.0.2.50", 24), ("192.0.2.51", 32), (("fe80::1", 0, 2), 64), index=2),
+            adapter("eth0:1", ("169.254.3.4", 16)),
+            adapter("tun0", ("198.51.100.7", 32), ("192.0.2.50", 24)),
+            adapter("wlan0", (("2001:db8::5", 0, 0), 64)),
+        ]
+        with mock.patch.object(relay_mod.ifaddr, "get_adapters", AdapterSequence([], adapters)):
+            current = relay_mod.Addresses().current()
+        # zeroconf 0.151.5, zeroconf/_utils/net.py, get_all_addresses_ipv4
+        zeroconf_view = list({addr.ip for iface in adapters for addr in iface.ips if addr.is_IPv4})
+        self.assertEqual(current, frozenset(zeroconf_view))
+        self.assertEqual(current, frozenset(
+            {"127.0.0.1", "192.0.2.50", "192.0.2.51", "169.254.3.4", "198.51.100.7"}))
+
+    def test_default_stub_mirrors_ifaddr(self):
+        adapters = relay_mod.ifaddr.get_adapters()
+        self.assertEqual(type(adapters).__name__, "dict_values")
+        ips = [ip for a in adapters for ip in a.ips]
+        self.assertEqual([ip.is_IPv4 for ip in ips], [True, False, True, False])
+        self.assertEqual([ip.is_IPv6 for ip in ips], [False, True, False, True])
+        self.assertEqual(ips[1].ip, ("::1", 0, 0))
+
+    def test_usable_means_outside_loopback(self):
+        self.assertFalse(relay_mod.has_usable_address(frozenset()))
+        self.assertFalse(relay_mod.has_usable_address(frozenset({"127.0.0.1", "127.0.1.1"})))
+        self.assertTrue(relay_mod.has_usable_address(frozenset({"127.0.0.1", "169.254.3.4"})))
+
+    def test_oserror_from_get_adapters_is_no_addresses_and_logged_once(self):
+        steps = AdapterSequence([], OSError(105, "No buffer space available"),
+                                OSError(105, "No buffer space available"), BASE)
+        addresses = relay_mod.Addresses()
+        with mock.patch.object(relay_mod.ifaddr, "get_adapters", steps):
+            with self.assertLogs("mdns_relay", level="INFO") as logs:
+                self.assertEqual(addresses.current(), frozenset())
+                self.assertEqual(addresses.current(), frozenset())
+                self.assertEqual(addresses.current(), frozenset({"127.0.0.1", "192.0.2.50"}))
+        self.assertEqual(logs.output, [
+            "WARNING:mdns_relay:listing the network interfaces failed: OSError: "
+            "[Errno 105] No buffer space available",
+            "INFO:mdns_relay:listing the network interfaces works again",
+        ])
+
+
+class AddressWatchRunTests(unittest.IsolatedAsyncioTestCase):
+    """run() with fake zeroconf, a short check interval and scripted adapters."""
+
+    def setUp(self):
+        self.events: List[str] = []
+        events = self.events
+
+        class FakeZeroconf:
+            def __init__(self):
+                events.append("zeroconf constructed")
+                self.zeroconf = object()
+
+            async def async_close(self):
+                events.append("zeroconf closed")
+
+        class FakeBrowser:
+            def __init__(self, zeroconf, service_type, handlers):
+                events.append("browser started")
+
+            async def async_cancel(self):
+                events.append("browser cancelled")
+
+        async def fake_resync_loop(relay, interval):
+            await asyncio.Event().wait()
+
+        original_watch = relay_mod.watch_addresses
+
+        async def watch(*args):
+            try:
+                return await original_watch(*args)
+            except asyncio.CancelledError:
+                events.append("watch cancelled")
+                raise
+
+        for target, name, value in (
+            (relay_mod, "AsyncZeroconf", FakeZeroconf),
+            (relay_mod, "AsyncServiceBrowser", FakeBrowser),
+            (relay_mod, "ADDRESS_CHECK_INTERVAL_SECONDS", 0.01),
+            (relay_mod, "watch_addresses", watch),
+            (relay_mod.Relay, "resync_loop", fake_resync_loop),
+        ):
+            patcher = mock.patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def use_adapters(self, *steps) -> AdapterSequence:
+        sequence = AdapterSequence(self.events, *steps)
+        patcher = mock.patch.object(relay_mod.ifaddr, "get_adapters", sequence)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return sequence
+
+    async def run_relay(self, duration: float = 0) -> int:
+        return await asyncio.wait_for(relay_mod.run("127.0.0.1", 15353, duration, 60), 5)
+
+    async def test_change_during_run_returns_75(self):
+        self.use_adapters(BASE, BASE, CHANGED)
+        with self.assertLogs("mdns_relay", level="INFO") as logs:
+            result = await self.run_relay()
+        self.assertEqual(result, relay_mod.EXIT_ADDRESSES_CHANGED)
+        self.assertIn(
+            "WARNING:mdns_relay:IPv4 addresses changed (127.0.0.1, 192.0.2.50 -> 127.0.0.1, "
+            "192.0.2.60), exiting so systemd restarts the relay",
+            logs.output,
+        )
+        self.assertIn("browser cancelled", self.events)
+        self.assertLess(self.events.index("browser cancelled"), self.events.index("zeroconf closed"))
+        self.assertNotIn("watch cancelled", self.events)
+
+    async def test_unchanged_addresses_keep_running_and_stop_returns_0(self):
+        sequence = self.use_adapters(BASE)
+        with self.assertNoLogs("mdns_relay", level="WARNING"):
+            result = await self.run_relay(duration=0.1)
+        self.assertEqual(result, 0)
+        # The snapshot and several checks while running
+        self.assertGreater(sequence.calls, 2)
+        self.assertEqual(self.events[-3:], ["browser cancelled", "watch cancelled", "zeroconf closed"])
+
+    async def test_only_loopback_at_start_waits_until_an_address_appears(self):
+        self.use_adapters(LOOPBACK_ONLY, LOOPBACK_ONLY, BASE)
+        with self.assertLogs("mdns_relay", level="INFO") as logs:
+            result = await self.run_relay(duration=0.05)
+        self.assertEqual(result, 0)
+        warnings = [line for line in logs.output if line.startswith("WARNING:")]
+        self.assertEqual(warnings, ["WARNING:mdns_relay:no IPv4 address yet, waiting before joining mDNS"])
+        self.assertIn("INFO:mdns_relay:IPv4 address found, joining mDNS", logs.output)
+        self.assertIn("INFO:mdns_relay:IPv4 addresses: 127.0.0.1, 192.0.2.50", logs.output)
+        # No zeroconf before the third read, the first with an address
+        self.assertEqual(self.events[:4], ["addresses read"] * 3 + ["zeroconf constructed"])
+
+    async def test_no_ipv4_at_all_waits_as_well(self):
+        self.use_adapters([adapter("lo", (("::1", 0, 0), 128))], BASE)
+        with self.assertLogs("mdns_relay", level="WARNING") as logs:
+            result = await self.run_relay(duration=0.05)
+        self.assertEqual(result, 0)
+        self.assertEqual(logs.output, ["WARNING:mdns_relay:no IPv4 address yet, waiting before joining mDNS"])
+        self.assertEqual(self.events[:3], ["addresses read"] * 2 + ["zeroconf constructed"])
+
+    async def test_stop_during_the_startup_wait_returns_0_without_zeroconf(self):
+        self.use_adapters(LOOPBACK_ONLY)
+        handlers: Dict[int, Any] = {}
+        loop = asyncio.get_running_loop()
+        loop.call_later(0.05, lambda: handlers[signal.SIGTERM]())
+        with mock.patch.object(loop, "add_signal_handler", lambda sig, callback: handlers.update({sig: callback})):
+            with self.assertLogs("mdns_relay", level="INFO") as logs:
+                result = await self.run_relay()
+        self.assertEqual(result, 0)
+        self.assertEqual(set(handlers), {signal.SIGTERM, signal.SIGINT})
+        self.assertNotIn("zeroconf constructed", self.events)
+        self.assertTrue(any("stopped before joining mDNS" in line for line in logs.output))
+
+    async def test_snapshot_is_taken_right_before_zeroconf_is_constructed(self):
+        self.use_adapters(BASE)
+        with self.assertLogs("mdns_relay", level="INFO"):
+            await self.run_relay(duration=0.02)
+        self.assertEqual(self.events[:3], ["addresses read", "zeroconf constructed", "browser started"])
+
+    async def test_runtime_error_from_zeroconf_returns_75(self):
+        self.use_adapters(BASE)
+
+        def refuse():
+            self.events.append("zeroconf constructed")
+            raise RuntimeError("No interfaces to listen on, check that any interfaces have IP version "
+                               "IPVersion.V4Only")
+
+        with mock.patch.object(relay_mod, "AsyncZeroconf", refuse):
+            with self.assertLogs("mdns_relay", level="WARNING") as logs:
+                result = await self.run_relay()
+        self.assertEqual(result, relay_mod.EXIT_ADDRESSES_CHANGED)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("zeroconf could not start (No interfaces to listen on", logs.output[0])
+        self.assertIn("exiting so systemd restarts the relay", logs.output[0])
+        self.assertNotIn("browser started", self.events)
+
+    async def test_oserror_during_the_startup_wait_is_logged_once(self):
+        error = OSError(105, "No buffer space available")
+        self.use_adapters(error, error, error, BASE)
+        with self.assertLogs("mdns_relay", level="WARNING") as logs:
+            result = await self.run_relay(duration=0.02)
+        self.assertEqual(result, 0)
+        self.assertEqual(len([line for line in logs.output if "listing the network interfaces failed" in line]), 1)
+        self.assertIn("zeroconf constructed", self.events)
 
 
 # ==============================================================================
