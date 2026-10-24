@@ -251,15 +251,22 @@ def _load_lan_relay(lan_raw: Dict[str, Any]) -> LanRelayConfig:
         raise ConfigError(f"lan_relay.listen_port must be 1-65535, got {port}")
 
     sources = [str(s) for s in (lan_raw.get("allowed_sources") or [])]
+    # Duplicates are allowed: the receiver keeps one state per address
     for source in sources:
         try:
-            ipaddress.ip_address(source)
+            address = ipaddress.ip_address(source)
         except ValueError:
             raise ConfigError(
                 f"lan_relay.allowed_sources entry {source!r} is not an IP address. "
                 f"Use addresses, not hostnames, so a DNS answer cannot widen who "
                 f"may feed state into the service."
             ) from None
+        if address.version != 4:
+            raise ConfigError(
+                f"lan_relay.allowed_sources entry {source!r} is an IPv6 address. The "
+                f"receiver listens on IPv4 only, so nothing from it could ever arrive. "
+                f"Use the IPv4 address the relay's datagrams arrive from."
+            )
 
     enabled = bool(lan_raw.get("enabled", False))
     if enabled and not sources:

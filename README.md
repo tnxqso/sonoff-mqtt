@@ -52,6 +52,8 @@ eWeLink devices announce their state over mDNS (`_ewelink._tcp`), encrypted with
 
 The relay in `relay/` closes that gap. It runs on a machine on the devices' own network, watches `_ewelink._tcp` and forwards every record unchanged as one UDP datagram to this service. It also resends every current record at a fixed interval, 60 s by default, so a lost datagram or a restart of this service heals by itself. The relay holds no devicekeys and never decrypts: the payload is still encrypted when it crosses the network, and this service decrypts it with the keys it already has from the cloud device listing.
 
+There can be one relay or several, for example one per site. Nothing in a datagram names its relay or site, so this service knows a relay only by the source address its datagrams arrive from. Each relay therefore needs a fixed address, for example a DHCP reservation, listed in `lan_relay.allowed_sources`.
+
 This service takes two things from the relay records:
 
 - Device state, described under LAN state below.
@@ -70,20 +72,43 @@ This is optional and off by default, see `lan_relay` in `config/config.example.y
 The receiver is configured under `lan_relay` in `config/config.example.yml`:
 
 - `enabled`: off by default. When on, `allowed_sources` must not be empty.
-- `listen_port`: the UDP port the receiver listens on, IPv4 only, 15353 by default. It must match the relay's `RELAY_PORT`.
-- `allowed_sources`: the addresses datagrams are accepted from, as IP addresses, not host names. Datagrams from any other address are dropped. Use the address the datagrams arrive from as seen by this service, which differs from the relay's LAN address if they pass through NAT or a tunnel.
-- `silence_warning_seconds`: log a warning when nothing has arrived for this long, 180 by default and at least 10. Keep it at a few times the relay's resync interval.
+- `listen_port`: the UDP port the receiver listens on, IPv4 only, 15353 by default. It must match each relay's `RELAY_PORT`.
+- `allowed_sources`: one IPv4 address per relay, not host names. Datagrams from any other address are dropped, and an IPv6 entry is refused at startup, as the receiver listens on IPv4 only. Use the address the datagrams arrive from as seen by this service, which differs from the relay's LAN address if they pass through NAT or a tunnel. A duplicate entry counts as one relay.
+- `silence_warning_seconds`: log a warning when nothing has arrived from a relay for this long, 180 by default and at least 10. It applies to each relay on its own, including a relay not heard from at all since startup. Keep it at a few times the relays' resync interval.
 - `command_devices`: the devices commanded over the LAN first, empty by default. Needs `enabled`. Quote a deviceid that is all digits, or YAML reads it as a number.
+
+### Several relays
+
+Every log line about a datagram names its relay first, for example:
+
+```
+LAN relay <relay-address>: first datagram since start (run <run-id>, n=<n>)
+LAN relay <relay-address>: relay restarted (run <run-id>, was <run-id>)
+LAN relay <relay-address>: 2 datagram(s) lost (run <run-id>, n=<n> after <n>)
+LAN relay <relay-address>: nothing received for 190s, LAN state from this relay is going stale
+LAN relay <relay-address>: nothing received since start 190s ago
+LAN relay <relay-address>: receiving again after 250s
+```
+
+Run ids, lost datagrams and silence are tracked per relay, so switching between relays is not taken for a restart. The silence warning is logged once per silent spell of a relay, and the recovery line when that relay is heard again.
+
+Each device has one owner: the relay whose latest record for it was accepted and decrypted. While the owner's latest record for the device is fresh (see below), records for it from any other relay are ignored, with one warning per device and relay:
+
+```
+LAN relay <other-address>: Updated <deviceid> ignored, owned by <owner-address> (last record 20s ago)
+```
+
+Once the owner's record is older than that, the next decrypted record from another relay takes the device over, logged as `LAN relay <new-address>: <deviceid> now owned by this relay, <old-address> silent for 151s`. A restart of the owning relay is not a change of owner. A `Removed` counts only from the owner, and frees the device for any relay; a `Removed` from another relay changes nothing. So a device that two relays can both see is used through one of them, without its state or address flapping between the two.
 
 ### How fresh a device address is
 
-A LAN command is only sent to an address from a relay record received within the last 150 s (`ENDPOINT_FRESH_SECONDS` in `src/sonoff_mqtt/lan_relay.py`). Every accepted record refreshes it, including a Resync with an unchanged seq, so the address follows a device that has changed address. The value assumes the relay's default resync of 60 s and allows two lost resends; with a longer resync the addresses can go stale between resends, see [relay/README.md](relay/README.md).
+A LAN command is only sent to an address from a record of the device's owner received within the last 150 s (`ENDPOINT_FRESH_SECONDS` in `src/sonoff_mqtt/lan_relay.py`). Every accepted record refreshes it, including a Resync with an unchanged seq, so the address follows a device that has changed address. A record is only accepted once its payload decrypts with the device's devicekey, and only an IPv4 address is used. Loopback, multicast, link-local, the limited broadcast address 255.255.255.255, 0.0.0.0/8 and other reserved addresses are skipped. A directed broadcast address such as x.y.z.255 cannot be recognised, because the record carries no prefix length, so it is used like any other address. The value assumes the relays' default resync of 60 s and allows two lost resends; with a longer resync the addresses can go stale between resends, see [relay/README.md](relay/README.md).
 
-Fresh measures only that the relay keeps resending the record, not that the device is reachable. The relay resends from its own cache, so a device that has lost power or wifi keeps a fresh address for as long as the relay holds its record. A LAN command to such a device fails or gets no answer within 2 s, and falls back to the cloud.
+Fresh measures only that the relay keeps resending the record, not that the device is reachable. The relay resends from its own cache, so a device that has lost power or wifi keeps a fresh address for as long as the relay holds its record, which can be about 19 minutes (see Limitations). A LAN command to such a device fails or gets no answer within 2 s, and falls back to the cloud.
 
 ### LAN commands
 
-Devices listed in `lan_relay.command_devices` are commanded over the LAN first. The command goes straight to the device's own HTTP server, at the address and port in its latest relay record, encrypted with its devicekey the same way the SonoffLAN integration does it. The relay only carries the result: the command counts as confirmed when a record with a new seq shows the commanded state. In testing that took about 50 ms, against two to three seconds through the cloud. Firmware 3.7.6 counts seq up even for a command that changes nothing, so that is confirmed as well.
+Devices listed in `lan_relay.command_devices` are commanded over the LAN first. The command goes straight to the device's own HTTP server, at the address and port in the latest record from its owning relay, encrypted with its devicekey the same way the SonoffLAN integration does it. The relay only carries the result: the command counts as confirmed when a record with a new seq shows the commanded state. In testing that took about 50 ms, against two to three seconds through the cloud. Firmware 3.7.6 counts seq up even for a command that changes nothing, so that is confirmed as well.
 
 Anything short of that falls back to the cloud path with its full read-back, so the error topic means the same either way: no relay record for the device in the last 150 s, a request the device rejected or did not answer within 2 s, or no confirmation within 3 s. Resending through the cloud after an unconfirmed LAN command is safe because commands are `ON` or `OFF`, never a toggle.
 
@@ -344,7 +369,8 @@ These are known and accepted:
 - The devices' LAN network is treated as trusted. A record must be encrypted when the device has a devicekey, but the payload is AES-CBC without a MAC, so a replay of an old ciphertext with a new seq is possible.
 - After a relay restart, a delayed datagram from the previous relay run counts as a new run, because late datagrams are only recognised within the same run, and it can be applied. The next resync corrects it.
 - In the relay, two resolves for the same device that overlap (for example Added then Updated) can finish out of order, and the one that finishes last is the record that is sent and resent. The order of their results has not been verified against zeroconf's cache behaviour; a later announcement of the device corrects it.
-- The device address and port are taken from a record that passes the checks (matching `id`, encrypted when the device has a devicekey, a `seq`) before its payload is decrypted, so a record whose payload cannot be decrypted still updates them.
+- The device address and port travel in plaintext next to the encrypted payload. A record is only used once its payload decrypts, but that does not authenticate the address: whoever can send datagrams from a relay's address can point LAN commands at another address. Network rules must restrict where this service can connect to.
+- The relay's zeroconf library raises any PTR TTL below 1125 s to 1125 s, so a device that loses power can stay in a relay's cache, and keep a fresh address here, for up to about 19 minutes. LAN commands to it fail or time out and fall back to the cloud. For the same reason another relay can take such a device over only once its old relay has dropped it.
 
 ## Running the tests
 

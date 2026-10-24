@@ -109,9 +109,10 @@ class EndpointTests(unittest.TestCase):
 
     def test_resync_with_same_seq_refreshes_and_follows_new_address(self):
         self.feed(record(CAMERA, 1, {"switch": "off"}, 1))
-        address, port, _ = self.receiver._endpoints[CAMERA]
+        entry = self.receiver._devices[CAMERA]
+        address, port, _ = entry.endpoint
         stale = time.monotonic() - lan_relay_module.ENDPOINT_FRESH_SECONDS - 1
-        self.receiver._endpoints[CAMERA] = (address, port, stale)
+        entry.endpoint = (address, port, stale)
         self.assertIsNone(self.receiver.endpoint_for(CAMERA))
         self.feed(record(CAMERA, 1, {"switch": "off"}, 2, event="Resync",
                          addresses=("192.168.100.99",)))
@@ -163,6 +164,16 @@ class ConfigTests(unittest.TestCase):
     def test_requires_enabled_relay(self):
         with self.assertRaises(ConfigError):
             _load_lan_relay({"enabled": False, "command_devices": [CAMERA]})
+
+    def test_ipv6_allowed_source_is_rejected(self):
+        for bad in ["2001:db8::1", "::ffff:192.0.2.10"]:
+            with self.assertRaises(ConfigError, msg=bad) as caught:
+                _load_lan_relay(self.base(allowed_sources=["192.0.2.10", bad]))
+            self.assertIn("IPv6", str(caught.exception))
+
+    def test_several_and_duplicate_allowed_sources_are_kept_as_given(self):
+        sources = ["192.0.2.10", "198.51.100.10", "192.0.2.10"]
+        self.assertEqual(_load_lan_relay(self.base(allowed_sources=sources)).allowed_sources, sources)
 
 
 # ==============================================================================
@@ -474,9 +485,10 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.cloud.calls, [{"switch": "on"}, None])
 
     async def test_stale_endpoint_goes_to_cloud(self):
-        address, port, _ = self.receiver._endpoints[CAMERA]
+        entry = self.receiver._devices[CAMERA]
+        address, port, _ = entry.endpoint
         stale = time.monotonic() - lan_relay_module.ENDPOINT_FRESH_SECONDS - 1
-        self.receiver._endpoints[CAMERA] = (address, port, stale)
+        entry.endpoint = (address, port, stale)
         await self.observer._send_command(CAMERA, "switch", "ON")
         self.assertEqual(self.sender.calls, [])
         self.assertEqual(self.cloud.calls, [{"switch": "on"}, None])
