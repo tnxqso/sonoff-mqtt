@@ -19,6 +19,14 @@ For the full background see the top-level `README.md` of this repository. The da
 - `python3-venv`, to create the relay's own virtual environment.
 - The Pi must be on the same network (link) as the devices.
 - The network path from the Pi to the host running sonoff-mqtt must allow UDP to the receiver port (15353 by default), including any firewall in between.
+- A firewall on the Pi itself must accept both incoming mDNS (UDP port 5353, multicast to 224.0.0.251) and IGMP. Without mDNS the relay hears no devices at all. Without IGMP it works at first and then goes deaf: routers that act as IGMP querier with IGMP snooping (seen on Asus routers) send periodic membership queries, and if the Pi does not answer them its membership of the mDNS group 224.0.0.251 expires after about 260 s. From then on no IPv4 multicast reaches the Pi. With nftables and an input chain with policy drop, add these rules to that chain:
+
+  ```
+  udp dport 5353 accept
+  ip protocol igmp accept
+  ```
+
+  To accept mDNS only from the devices' network, use `ip saddr <devices-subnet> udp dport 5353 accept` instead of the first rule.
 - sonoff-mqtt must have the relay enabled and accept the Pi as a source. In its config, under `lan_relay`: `enabled: true`, `listen_port` equal to the relay's port, and the Pi's address in `allowed_sources` (IPv4 addresses, not host names). With several relays, for example one per site, each has its own entry there. sonoff-mqtt knows a relay only by this address, so each Pi needs a fixed one, for example a DHCP reservation. Use the address the datagrams arrive from as seen by sonoff-mqtt, which differs from the Pi's LAN address if they pass through NAT or a tunnel. See `config/config.example.yml`.
 
 ## Installation on a new Pi
@@ -98,6 +106,19 @@ Signs of trouble:
 - `WARNING sending to <address>:<port> failed: ...`: the path to sonoff-mqtt is down. Only the first failure is logged, then `INFO sending to ... works again` when it recovers.
 - `error: argument --target: not an IPv4 address: ''` and the service stopped with status 2 instead of restarting: `RELAY_TARGET` is not set in `/etc/default/sonoff-lan-relay`. Set it, then run `systemctl restart sonoff-lan-relay`.
 - No `Added` lines at all: the Pi does not see the devices' mDNS, for example because it is on another network or VLAN.
+- `INFO Removed <deviceid>` for every device at once after a normal start, with no warning or error before it: the router has stopped sending multicast to the Pi, usually because a firewall on the Pi drops IGMP (see Requirements). On one site, multicast stopped about 4 minutes after start, when the membership expired, and the `Removed` lines followed roughly 20 minutes after start, because zeroconf keeps records for up to about 1125 s (see Limitations in the top-level `README.md`). To check, with `<iface>` the Pi's interface on the devices' network:
+
+  ```sh
+  tcpdump -ni <iface> igmp
+  ```
+
+  This is the conclusive check. It must show a membership report from the Pi after each query from the router. A query from the router with no report from the Pi after it means IGMP is blocked on the Pi.
+
+  ```sh
+  ip -4 maddr show dev <iface>
+  ```
+
+  This only shows the Pi's own kernel membership, which stays even when the router has stopped forwarding. 224.0.0.251 in the list confirms that the relay joined the mDNS group, but does not detect this fault.
 - `WARNING no IPv4 address yet, waiting before joining mDNS`: the relay started before the Pi had an IPv4 address other than loopback. It checks every 15 s and logs `INFO IPv4 address found, joining mDNS` when one appears. If it keeps waiting, the Pi's network is not up.
 - `WARNING IPv4 addresses changed (<old> -> <new>), exiting so systemd restarts the relay`, then a new start: expected after an address change, see Network addresses below. Repeated after every restart, it points to an interface whose address keeps coming and going.
 - `WARNING zeroconf could not start (...), exiting so systemd restarts the relay`: zeroconf found no interface to listen on. systemd starts the relay again after 10 s.
