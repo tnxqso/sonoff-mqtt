@@ -5,4 +5,4 @@ pyproject.toml if packaging is ever added. A user asked which version they are
 running should be able to answer from the log alone, without inspecting files.
 """
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
