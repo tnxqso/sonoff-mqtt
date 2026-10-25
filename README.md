@@ -386,7 +386,7 @@ PYTHONPATH=src .venv/bin/python -m unittest tests/test_lan_relay.py tests/test_l
 
 zeroconf is not needed to run the tests and is not in the project's `requirements.txt`: `tests/test_mdns_relay.py` replaces the zeroconf modules the relay imports with stubs before loading it.
 
-`tests/test_shared_device.py` is not part of this set. It is a live probe against a real eWeLink account, run directly with Python, and is described at the top of the file.
+`scripts/probe_shared_device.py` is not part of this set. It is a live probe against a real eWeLink account, run directly with Python as `python scripts/probe_shared_device.py --account NAME`, and is described at the top of the file.
 
 ## Credits
 

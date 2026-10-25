@@ -97,4 +97,4 @@ get_devices(list_of_home_ids) returns devices from every home, including the one
 that is not currently active in the phone app. A plain listing sees only the
 active home, which is a trap the binding never got past.
 
-See tests/test_shared_device.py for the probe that established all of this.
+See scripts/probe_shared_device.py for the probe that established all of this.

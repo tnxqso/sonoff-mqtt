@@ -16,10 +16,14 @@ a home that is not our active one, so this also exercises multi-home discovery.
 
 Usage:
     export SONOFF_SHAREE_PASSWORD='...'
-    python tests/test_shared_device.py
+    python scripts/probe_shared_device.py --account NAME
+
+NAME is the account in config/config.yml whose session is used: the SHAREE,
+the account the lamp was shared to.
 """
 
 # 1. Standard library
+import argparse
 import asyncio
 import logging
 import sys
@@ -39,14 +43,25 @@ CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "config.yml"
 # A patio lamp at the other site, shared to our account. S26R2, uiid 1.
 TARGET_DEVICEID = "CHANGE_ME"
 
-# Which configured account to log in as. This is the SHAREE, the account the
-# lamp was shared to, which is the whole point of the test.
-ACCOUNT_NAME = "mikel"
-
 log = logging.getLogger("probe")
 
 
-async def main() -> None:
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Probe whether a shared device can be commanded from the sharee's own session."
+    )
+    # Which configured account to log in as. This is the SHAREE, the account the
+    # lamp was shared to, which is the whole point of the test.
+    parser.add_argument(
+        "--account",
+        required=True,
+        metavar="NAME",
+        help="name of the account in config/config.yml whose session is used (the sharee)",
+    )
+    return parser.parse_args()
+
+
+async def main(account_name: str) -> None:
     config = load_config(CONFIG_PATH)
 
     logging.basicConfig(
@@ -57,11 +72,11 @@ async def main() -> None:
     # want here even if it is too much for normal running
     logging.getLogger("sonoff_mqtt.vendor.ewelink.cloud").setLevel(logging.DEBUG)
 
-    account = next((a for a in config.accounts if a.name == ACCOUNT_NAME), None)
+    account = next((a for a in config.accounts if a.name == account_name), None)
     if account is None:
         log.error(
             "No account named %r in the config. Configured: %s",
-            ACCOUNT_NAME,
+            account_name,
             [a.name for a in config.accounts],
         )
         return
@@ -186,4 +201,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    args = parse_args()
+    asyncio.run(main(args.account))
