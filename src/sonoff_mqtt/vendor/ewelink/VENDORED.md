@@ -55,11 +55,11 @@ No change to the vendored files is needed for that.
 
 ## Updating
 
-    cd /home/mikel/dev/SonoffLAN && git pull
+    cd <path-to-SonoffLAN> && git pull
     diff -u src/sonoff_mqtt/vendor/ewelink/cloud.py \
-            /home/mikel/dev/SonoffLAN/custom_components/sonoff/core/ewelink/cloud.py
+            <path-to-SonoffLAN>/custom_components/sonoff/core/ewelink/cloud.py
     diff -u src/sonoff_mqtt/vendor/ewelink/base.py \
-            /home/mikel/dev/SonoffLAN/custom_components/sonoff/core/ewelink/base.py
+            <path-to-SonoffLAN>/custom_components/sonoff/core/ewelink/base.py
 
 Copy the new versions in, update the commit and date above, and re-run the
 integration tests. Pay particular attention to changes in send(), the payload

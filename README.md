@@ -231,13 +231,13 @@ mosquitto_sub -h your-broker -t 'sonoff/#' -v
 Command a device directly, bypassing whatever normally drives it:
 
 ```bash
-mosquitto_pub -h your-broker -t 'sonoff/10020db9d1/switch/set' -m 'ON'
+mosquitto_pub -h your-broker -t 'sonoff/100000000a/switch/set' -m 'ON'
 ```
 
 Clear a stale error topic:
 
 ```bash
-mosquitto_pub -h your-broker -t 'sonoff/10020db9d1/switch/error' -r -n
+mosquitto_pub -h your-broker -t 'sonoff/100000000a/switch/error' -r -n
 ```
 
 ### What a healthy command looks like
@@ -245,24 +245,24 @@ mosquitto_pub -h your-broker -t 'sonoff/10020db9d1/switch/error' -r -n
 Through the cloud:
 
 ```text
-Webbkamera switch -> OFF
-Webbkamera switch: confirmed
+Test camera switch -> OFF
+Test camera switch: confirmed
 ```
 
 Over the LAN, for a device in `lan_relay.command_devices`:
 
 ```text
-Webbkamera switch -> OFF (LAN)
-Webbkamera switch is OFF (LAN state, seq 8427)
-Webbkamera switch: confirmed via LAN in 49 ms
+Test camera switch -> OFF (LAN)
+Test camera switch is OFF (LAN state, seq 8427)
+Test camera switch: confirmed via LAN in 49 ms
 ```
 
 The middle line is the relay reporting the new state, and it is absent when the command changed nothing. When the LAN path gives up, one of these lines comes first and the cloud lines above follow:
 
 ```text
-Webbkamera switch: no fresh relay record for the address, using the cloud
-Webbkamera switch: LAN command not accepted (timeout), falling back to the cloud
-Webbkamera switch: not confirmed via LAN within 3.0s, falling back to the cloud
+Test camera switch: no fresh relay record for the address, using the cloud
+Test camera switch: LAN command not accepted (timeout), falling back to the cloud
+Test camera switch: not confirmed via LAN within 3.0s, falling back to the cloud
 ```
 
 If `confirmed` is replaced by a line saying the state did not change, the cloud accepted the command and the device did not obey. That is the case this service exists to surface, and the one that previously went unnoticed.
@@ -294,9 +294,9 @@ Devices appear as ordinary MQTT things. Payloads are plain `ON` and `OFF`, so no
 ```java
 Thing mqtt:topic:Sonoff_Webcam "Sonoff S26R2: Webcam" (mqtt:broker:MyBroker) {
 Channels:
-    Type switch : SwitchBinary "Switch" [ stateTopic="sonoff/10020db9d1/switch", commandTopic="sonoff/10020db9d1/switch/set" ]
-    Type string : CommandError "Command error" [ stateTopic="sonoff/10020db9d1/switch/error" ]
-    Type number : Rssi "RSSI" [ stateTopic="sonoff/10020db9d1/rssi" ]
+    Type switch : SwitchBinary "Switch" [ stateTopic="sonoff/100000000a/switch", commandTopic="sonoff/100000000a/switch/set" ]
+    Type string : CommandError "Command error" [ stateTopic="sonoff/100000000a/switch/error" ]
+    Type number : Rssi "RSSI" [ stateTopic="sonoff/100000000a/rssi" ]
 }
 ```
 
@@ -305,11 +305,11 @@ A four channel device gets one channel per outlet:
 ```java
 Thing mqtt:topic:Sonoff_FourChPro "Sonoff 4CHPROR3" (mqtt:broker:MyBroker) {
 Channels:
-    Type switch : SwitchBinary0 "Outlet 0" [ stateTopic="sonoff/1001d504c3/switch0", commandTopic="sonoff/1001d504c3/switch0/set" ]
-    Type string : CommandError0 "Command error outlet 0" [ stateTopic="sonoff/1001d504c3/switch0/error" ]
-    Type switch : SwitchBinary1 "Outlet 1" [ stateTopic="sonoff/1001d504c3/switch1", commandTopic="sonoff/1001d504c3/switch1/set" ]
-    Type string : CommandError1 "Command error outlet 1" [ stateTopic="sonoff/1001d504c3/switch1/error" ]
-    Type number : Rssi "RSSI" [ stateTopic="sonoff/1001d504c3/rssi" ]
+    Type switch : SwitchBinary0 "Outlet 0" [ stateTopic="sonoff/100000000b/switch0", commandTopic="sonoff/100000000b/switch0/set" ]
+    Type string : CommandError0 "Command error outlet 0" [ stateTopic="sonoff/100000000b/switch0/error" ]
+    Type switch : SwitchBinary1 "Outlet 1" [ stateTopic="sonoff/100000000b/switch1", commandTopic="sonoff/100000000b/switch1/set" ]
+    Type string : CommandError1 "Command error outlet 1" [ stateTopic="sonoff/100000000b/switch1/error" ]
+    Type number : Rssi "RSSI" [ stateTopic="sonoff/100000000b/rssi" ]
 }
 ```
 
