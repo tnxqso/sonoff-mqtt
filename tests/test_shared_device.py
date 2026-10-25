@@ -15,7 +15,7 @@ The test device is a lamp at the other site, shared to our account and placed in
 a home that is not our active one, so this also exercises multi-home discovery.
 
 Usage:
-    export SONOFF_MIKEL_PASSWORD='...'
+    export SONOFF_SHAREE_PASSWORD='...'
     python tests/test_shared_device.py
 """
 
@@ -36,7 +36,7 @@ from sonoff_mqtt.vendor.ewelink.cloud import XRegistryCloud
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "config.yml"
 
-# Fredrik's patio lamp, shared to our account. S26R2, uiid 1.
+# A patio lamp at the other site, shared to our account. S26R2, uiid 1.
 TARGET_DEVICEID = "CHANGE_ME"
 
 # Which configured account to log in as. This is the SHAREE, the account the
@@ -182,7 +182,7 @@ async def main() -> None:
         log.info("")
         log.info("Done. Two things decide the outcome:")
         log.info("  1. did every receipt come back 'online'")
-        log.info("  2. did the lamp physically move (ask Fredrik, or watch the app)")
+        log.info("  2. did the lamp physically move (ask the owner, or watch the app)")
 
 
 if __name__ == "__main__":

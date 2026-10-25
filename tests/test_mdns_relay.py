@@ -140,7 +140,7 @@ def tearDownModule():
 # Fakes and helpers
 # ==============================================================================
 
-DEVICE = "10020db9d1"
+DEVICE = "100000000a"
 NAME = f"eWeLink_{DEVICE}._ewelink._tcp.local."
 
 
@@ -198,7 +198,7 @@ def fake_service_info(properties: Dict[str, Dict[bytes, Any]], gate: Optional[as
             return True
 
         def parsed_addresses(self) -> List[str]:
-            return ["192.168.100.243", "fe80::1"]
+            return ["198.51.100.43", "fe80::1"]
 
     return FakeServiceInfo
 
@@ -216,7 +216,7 @@ def txt_for(deviceid: str, seq: int = 7) -> Dict[bytes, Any]:
 class SendTests(unittest.TestCase):
     def test_envelope_fields_and_types(self):
         relay = make_relay()
-        record = {"name": NAME, "deviceid": DEVICE, "addresses": ["192.168.100.243"],
+        record = {"name": NAME, "deviceid": DEVICE, "addresses": ["198.51.100.43"],
                   "port": 8081, "txt": {"seq": "1"}}
         self.assertTrue(relay.send("Added", record))
         (payload, target), = relay.sock.sent
@@ -329,7 +329,7 @@ class ChangeAndResolveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message["event"], "Added")
         self.assertEqual(message["name"], NAME)
         self.assertEqual(message["deviceid"], DEVICE)
-        self.assertEqual(message["addresses"], ["192.168.100.243", "fe80::1"])
+        self.assertEqual(message["addresses"], ["198.51.100.43", "fe80::1"])
         self.assertEqual(message["port"], 8081)
         self.assertEqual(message["txt"], {"id": DEVICE, "seq": "7", "encrypt": "true",
                                           "iv": "aXY=", "data1": "ZGF0YQ==", "type": "plug"})
@@ -420,7 +420,7 @@ class ChangeAndResolveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([m["event"] for m in self.relay.sock.messages()], ["Removed"])
 
     async def test_removed_of_another_name_does_not_discard(self):
-        other = "eWeLink_1001d504c3._ewelink._tcp.local."
+        other = "eWeLink_100000000b._ewelink._tcp.local."
         gate = asyncio.Event()
         self.patch_info({NAME: txt_for(DEVICE)}, gate)
         self.relay.on_change(None, relay_mod.SERVICE_TYPE, NAME, ServiceStateChange.Added)
@@ -429,7 +429,7 @@ class ChangeAndResolveTests(unittest.IsolatedAsyncioTestCase):
         gate.set()
         await self.settle()
         self.assertEqual([(m["event"], m["deviceid"]) for m in self.relay.sock.messages()],
-                         [("Removed", "1001d504c3"), ("Added", DEVICE)])
+                         [("Removed", "100000000b"), ("Added", DEVICE)])
 
     async def test_zeroconf_error_is_logged(self):
         class FailingInfo:
@@ -457,10 +457,10 @@ class StopLoop(Exception):
 class ResyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_resends_every_record_at_the_interval(self):
         relay = make_relay()
-        other = "eWeLink_1001d504c3._ewelink._tcp.local."
+        other = "eWeLink_100000000b._ewelink._tcp.local."
         relay.records = {
             NAME: {"name": NAME, "deviceid": DEVICE, "txt": {"seq": "1"}},
-            other: {"name": other, "deviceid": "1001d504c3", "txt": {"seq": "2"}},
+            other: {"name": other, "deviceid": "100000000b", "txt": {"seq": "2"}},
         }
         intervals = []
 
@@ -478,8 +478,8 @@ class ResyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(intervals, [60, 60, 60])
         messages = relay.sock.messages()
         self.assertEqual([(m["event"], m["deviceid"], m["n"]) for m in messages], [
-            ("Resync", DEVICE, 1), ("Resync", "1001d504c3", 2),
-            ("Resync", DEVICE, 3), ("Resync", "1001d504c3", 4),
+            ("Resync", DEVICE, 1), ("Resync", "100000000b", 2),
+            ("Resync", DEVICE, 3), ("Resync", "100000000b", 4),
         ])
         self.assertIn("Resync: 2 of 2 record(s) sent", logs.output[0])
 
@@ -891,7 +891,7 @@ class ContractTest(unittest.IsolatedAsyncioTestCase):
             relay.sock.close()
             await receiver.stop()
         self.assertEqual(collector.calls, [(DEVICE, {"switch": "on"}, "42", "Added")])
-        self.assertEqual(receiver.endpoint_for(DEVICE), ("192.168.100.243", 8081))
+        self.assertEqual(receiver.endpoint_for(DEVICE), ("198.51.100.43", 8081))
 
 
 if __name__ == "__main__":

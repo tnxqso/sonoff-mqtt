@@ -45,9 +45,9 @@ from sonoff_mqtt.observer import Observer
 
 # Made-up key in the same 36 character format as a real devicekey
 DEVICEKEY = "00000000-1111-2222-3333-444444444444"
-RELAY = "192.168.100.20"
-CAMERA = "10020db9d1"
-FOURCH = "1001d504c3"
+RELAY = "192.0.2.20"
+CAMERA = "100000000a"
+FOURCH = "100000000b"
 
 
 def encrypt_params(params: Dict[str, Any], devicekey: str = DEVICEKEY):
@@ -63,7 +63,7 @@ def encrypt_params(params: Dict[str, Any], devicekey: str = DEVICEKEY):
 
 
 def record(deviceid: str, seq: int, params: Dict[str, Any], n: int,
-           event: str = "Updated", addresses=("192.168.100.243",), port: Any = 8081) -> bytes:
+           event: str = "Updated", addresses=("198.51.100.43",), port: Any = 8081) -> bytes:
     """One relay datagram in protocol v1."""
     data, iv = encrypt_params(params)
     txt = {"data1": data, "id": deviceid, "seq": str(seq), "encrypt": "true", "iv": iv}
@@ -105,7 +105,7 @@ class EndpointTests(unittest.TestCase):
 
     def test_endpoint_from_record(self):
         self.feed(record(CAMERA, 1, {"switch": "off"}, 1))
-        self.assertEqual(self.receiver.endpoint_for(CAMERA), ("192.168.100.243", 8081))
+        self.assertEqual(self.receiver.endpoint_for(CAMERA), ("198.51.100.43", 8081))
 
     def test_resync_with_same_seq_refreshes_and_follows_new_address(self):
         self.feed(record(CAMERA, 1, {"switch": "off"}, 1))
@@ -115,8 +115,8 @@ class EndpointTests(unittest.TestCase):
         entry.endpoint = (address, port, stale)
         self.assertIsNone(self.receiver.endpoint_for(CAMERA))
         self.feed(record(CAMERA, 1, {"switch": "off"}, 2, event="Resync",
-                         addresses=("192.168.100.99",)))
-        self.assertEqual(self.receiver.endpoint_for(CAMERA), ("192.168.100.99", 8081))
+                         addresses=("198.51.100.99",)))
+        self.assertEqual(self.receiver.endpoint_for(CAMERA), ("198.51.100.99", 8081))
 
     def test_removed_forgets_endpoint(self):
         self.feed(record(CAMERA, 1, {"switch": "off"}, 1))
@@ -149,7 +149,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(_load_lan_relay(self.base()).command_devices, [])
 
     def test_valid_ids_are_lowercased_and_deduplicated(self):
-        config = _load_lan_relay(self.base(command_devices=["10020DB9D1", CAMERA]))
+        config = _load_lan_relay(self.base(command_devices=["100000000A", CAMERA]))
         self.assertEqual(config.command_devices, [CAMERA])
 
     def test_number_is_rejected(self):
@@ -157,7 +157,7 @@ class ConfigTests(unittest.TestCase):
             _load_lan_relay(self.base(command_devices=[1001234567]))
 
     def test_not_a_deviceid_is_rejected(self):
-        for bad in ["10020db9d", "10020db9d1x", "1002-db9d1", "Webbkamera"]:
+        for bad in ["100000000", "100000000ax", "1000-0000a", "Testcamera"]:
             with self.assertRaises(ConfigError, msg=bad):
                 _load_lan_relay(self.base(command_devices=[bad]))
 
@@ -405,9 +405,9 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             self.observer = Observer(config)
         self.cloud = FakeCloud(self.observer.registry)
         for deviceid, name, uiid, params in (
-            (CAMERA, "Webbkamera", 1, {"switch": "off"}),
-            (FOURCH, "4CHPROR3", 4, {"switches": [{"outlet": i, "switch": "off"} for i in range(4)]}),
-            ("1001df4bd4", "13.8V Powersupply", 1, {"switch": "off"}),
+            (CAMERA, "Test camera", 1, {"switch": "off"}),
+            (FOURCH, "Test power strip", 4, {"switches": [{"outlet": i, "switch": "off"} for i in range(4)]}),
+            ("100000000c", "Test power supply", 1, {"switch": "off"}),
         ):
             raw = {"deviceid": deviceid, "name": name, "extra": {"uiid": uiid},
                    "apikey": "own", "online": True, "params": params, "devicekey": DEVICEKEY}
@@ -419,7 +419,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.sender = FakeSender()
         self.observer._lan_sender = self.sender
         self.n = 0
-        for deviceid in (CAMERA, FOURCH, "1001df4bd4"):
+        for deviceid in (CAMERA, FOURCH, "100000000c"):
             device = self.observer.registry.get(deviceid)
             self.relay(deviceid, 100, device.params)
 
@@ -439,7 +439,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_confirmed_via_lan_skips_cloud(self):
         self.sender.then = lambda: self.relay(CAMERA, 101, {"switch": "on"})
         await self.observer._send_command(CAMERA, "switch", "ON")
-        self.assertEqual(self.sender.calls, [("192.168.100.243", 8081, CAMERA, {"switch": "on"})])
+        self.assertEqual(self.sender.calls, [("198.51.100.43", 8081, CAMERA, {"switch": "on"})])
         self.assertEqual(self.cloud.calls, [])
         self.assertEqual(self.published(f"sonoff/{CAMERA}/switch/error"), [""])
         self.assertIn("ON", self.published(f"sonoff/{CAMERA}/switch"))
@@ -480,7 +480,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(time.monotonic() - started, 0.25)
 
     async def test_device_not_listed_never_goes_lan(self):
-        await self.observer._send_command("1001df4bd4", "switch", "ON")
+        await self.observer._send_command("100000000c", "switch", "ON")
         self.assertEqual(self.sender.calls, [])
         self.assertEqual(self.cloud.calls, [{"switch": "on"}, None])
 
@@ -582,7 +582,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.sender.script = [(0.2, "timeout", None)]
         older = asyncio.create_task(self.observer._send_command(CAMERA, "switch", "ON"))
         await asyncio.sleep(0.05)
-        await self.observer._send_command("1001df4bd4", "switch", "ON")
+        await self.observer._send_command("100000000c", "switch", "ON")
         await older
         self.assertIn({"switch": "on"}, self.cloud.calls)
         self.assertEqual(self.published(f"sonoff/{CAMERA}/switch/error"), [""])
@@ -658,7 +658,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.published(f"sonoff/{FOURCH}/switch1/error"), [""])
         self.assertEqual(self.published(f"sonoff/{FOURCH}/switch1")[-1], "OFF")
         warnings = [r.getMessage() for r in logs.records if r.levelname == "WARNING"]
-        self.assertIn("4CHPROR3 switch1: state changed after a superseded send, resending OFF once",
+        self.assertIn("Test power strip switch1: state changed after a superseded send, resending OFF once",
                       warnings)
         self.assertFalse([r for r in logs.records if r.levelname == "ERROR"])
 
@@ -676,7 +676,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             ["command OFF undone by an older command and not confirmed after resending"],
         )
         errors = [r.getMessage() for r in logs.records if r.levelname == "ERROR"]
-        self.assertIn("4CHPROR3 switch1: still not OFF after resending, a superseded send "
+        self.assertIn("Test power strip switch1: still not OFF after resending, a superseded send "
                       "may have left the device in the wrong state", errors)
 
     async def test_final_check_uses_relay_when_cloud_cannot_be_read(self):
@@ -701,7 +701,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cloud.calls, [self.ON1, None])
         self.assertEqual(self.published(f"sonoff/{FOURCH}/switch1/error"), [""])
         infos = [r.getMessage() for r in logs.records if r.levelname == "INFO"]
-        self.assertIn("4CHPROR3 switch1: final state OFF checked after a superseded send", infos)
+        self.assertIn("Test power strip switch1: final state OFF checked after a superseded send", infos)
 
     async def test_still_newer_command_stops_the_final_check(self):
         sim, sender, cloud = self.use_sim()
@@ -709,12 +709,12 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs(observer_module._LOGGER, level="INFO") as logs:
             await self.ptt((0.1, "ON"))
         messages = [r.getMessage() for r in logs.records]
-        self.assertIn("4CHPROR3 switch1 -> OFF: superseded by a newer command, stopping "
+        self.assertIn("Test power strip switch1 -> OFF: superseded by a newer command, stopping "
                       "before waiting for an older send", messages)
         self.assertFalse([m for m in messages if "resending" in m])
         # Only the second ON checks the final state, with one query, and agrees
         self.assertEqual(cloud.calls, [self.ON1, None])
-        self.assertIn("4CHPROR3 switch1: final state ON checked after a superseded send", messages)
+        self.assertIn("Test power strip switch1: final state ON checked after a superseded send", messages)
         self.assertEqual(sim.outlets[1], "on")
         self.assertEqual(self.published(f"sonoff/{FOURCH}/switch1/error"), [""])
 
@@ -722,7 +722,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs(observer_module._LOGGER, level="INFO") as logs:
             # Through the cloud: one send and one read-back, nothing more
             started = time.monotonic()
-            await self.observer._send_command("1001df4bd4", "switch", "ON")
+            await self.observer._send_command("100000000c", "switch", "ON")
             self.assertLess(time.monotonic() - started, 0.25)
             self.assertEqual(self.cloud.calls, [{"switch": "on"}, None])
             # Over the LAN: one POST, no query
@@ -764,7 +764,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sender.calls, [self.ON1, self.OFF1, self.OFF1])
         self.assertEqual(self.sim_cloud.calls, [self.ON1, None])
         self.assertEqual(self.published(f"sonoff/{FOURCH}/switch1/error"), [""])
-        self.assertIn("4CHPROR3 switch1: state changed after a superseded send, resending OFF once",
+        self.assertIn("Test power strip switch1: state changed after a superseded send, resending OFF once",
                       [r.getMessage() for r in logs.records])
 
     async def test_send_ended_longer_ago_than_settle_is_no_overlap(self):
